@@ -30,3 +30,6 @@ git push origin "$branch_name"
 
 echo "Changements poussés sur la branche '$branch_name'."
 
+echo "############ Penser a renseigner (peux cree des pb) ############"
+echo "  git config --global user.email 'you@example.com'"
+echo "  git config --global user.name 'Your Name'   "
