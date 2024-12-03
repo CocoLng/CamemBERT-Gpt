@@ -1,2 +1,2 @@
 # CamemBert-Gpt
-Projet Finale pour Sorbonne Université, machine learning avancée
+Projet Final pour Sorbonne Université, machine learning avancé
