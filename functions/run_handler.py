@@ -5,7 +5,7 @@ import gradio as gr
 import wandb
 
 from .data_loader import DataLoader
-from .model_config import  ModelConfig
+from .model_config import ModelConfig
 from .test_predictor import TestPredictor
 from .training_config import GradioTrainingCallback, TrainingConfig
 
