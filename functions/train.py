@@ -54,7 +54,7 @@ class GradioTrainingCallback(TrainerCallback):
 
 @dataclass
 class TrainerArguments:
-    output_dir: str = "camembert-fr"
+    output_dir: str = "camembert-training"
     num_train_epochs: int = 3
     per_device_train_batch_size: int = 16
     learning_rate: float = 5e-5
@@ -67,26 +67,56 @@ class TrainerArguments:
     use_cuda: bool = True  # New parameter to control CUDA usage
 
 class CustomTrainer(Trainer):
-    """Custom trainer with enhanced error handling and monitoring"""
-    
-    def __init__(self, **kwargs):
+    def __init__(self, dataset_size=None, **kwargs):
         self.logger = logging.getLogger(__name__)
+        self.dataset_size = dataset_size
         if 'tokenizer' in kwargs:
             kwargs.pop('tokenizer')
         super().__init__(**kwargs)
         
         # Modifier la fréquence des checkpoints
-        self.args.save_steps = 5000  # Changement de 10000 à 5000
+        self.args.save_steps = 5000
         
-        # Créer les dossiers nécessaires
+        # Le dossier weights est déjà créé dans le run_dir
         self.weights_dir = os.path.join(self.args.output_dir, "weights")
-        os.makedirs(self.weights_dir, exist_ok=True)
         
-        # Sauvegarder la configuration initiale
+        # Sauvegarder la configuration initiale dans le run_dir
         self._save_model_info(self.args.output_dir)
 
+    def _save_model_info(self, directory: str):
+        """Sauvegarde les informations complètes du modèle"""
+        try:
+            info_path = os.path.join(directory, "model_info.txt")
+            with open(info_path, "w") as f:
+                # Information sur le dataset
+                f.write("=== Informations sur le Dataset ===\n")
+                if self.dataset_size:
+                    f.write(f"Nombre total de tokens: {self.dataset_size}\n")
+                    f.write(f"Taille approximative en GB: {self.dataset_size * 4 / (1024**3):.2f}\n")
+                f.write("\n")
+
+                # Architecture du modèle
+                f.write("=== Architecture du Modèle ===\n")
+                config_dict = self.model.config.to_dict()
+                for key, value in config_dict.items():
+                    f.write(f"{key}: {value}\n")
+                f.write("\n")
+
+                # Paramètres d'entraînement
+                f.write("=== Paramètres d'Entraînement ===\n")
+                f.write(f"Learning rate: {self.args.learning_rate}\n")
+                f.write(f"Batch size: {self.args.per_device_train_batch_size}\n")
+                f.write(f"Nombre d'epochs: {self.args.num_train_epochs}\n")
+                f.write(f"Warmup steps: {self.args.warmup_steps}\n")
+                f.write(f"Weight decay: {self.args.weight_decay}\n")
+                f.write(f"Gradient accumulation steps: {self.args.gradient_accumulation_steps}\n")
+                f.write(f"Save steps: {self.args.save_steps}\n")
+                f.write(f"Logging steps: {self.args.logging_steps}\n")
+                
+        except Exception as e:
+            self.logger.error(f"Error saving model info: {e}")
+
     def training_step(self, model, inputs, num_items_in_batch=None):
-        """Override training step avec logging des losses"""
         try:
             # Vérifier les clés nécessaires
             required_keys = {'input_ids', 'attention_mask', 'labels'}
@@ -100,14 +130,11 @@ class CustomTrainer(Trainer):
             # Calcul de la loss
             loss = super().training_step(model, inputs, num_items_in_batch)
             
-            # Enregistrer la loss dans le fichier de log
-            if self.state.global_step % self.args.logging_steps == 0:
-                self._log_loss(loss.item())
-
-            # À chaque checkpoint, sauvegarder les informations
+            # À chaque checkpoint, sauvegarder la loss
             if self.state.global_step % self.args.save_steps == 0:
                 checkpoint_dir = os.path.join(self.args.output_dir, f"checkpoint-{self.state.global_step}")
-                self._save_model_info(checkpoint_dir, loss.item())
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                self._save_loss_history(checkpoint_dir, loss.item())
                 
             return loss
             
@@ -115,57 +142,38 @@ class CustomTrainer(Trainer):
             self.logger.error(f"Error in training_step: {e}")
             raise
 
-    def _log_loss(self, loss: float):
-        """Enregistre la loss dans un fichier"""
-        log_path = os.path.join(self.args.output_dir, "loss_history.txt")
+    def _save_loss_history(self, checkpoint_dir: str, current_loss: float):
         try:
-            with open(log_path, "a") as f:
-                f.write(f"Step {self.state.global_step}: {loss}\n")
+            loss_file = os.path.join(checkpoint_dir, "loss_history.txt")
+            with open(loss_file, "w") as f:
+                f.write("=== Historique des Loss ===\n")
+                f.write("Format: Step: Loss\n\n")
+                for log in self.state.log_history:
+                    if 'loss' in log:
+                        step = log.get('step', 0)
+                        f.write(f"Step {step}: {log['loss']}\n")
+                f.write(f"Step {self.state.global_step}: {current_loss}\n")
         except Exception as e:
-            self.logger.error(f"Error logging loss: {e}")
+            self.logger.error(f"Error saving loss history: {e}")
 
-    def _save_model_info(self, directory: str, current_loss: float = None):
-        """Sauvegarde les informations du modèle"""
-        try:
-            info_path = os.path.join(directory, "model_info.txt")
-            with open(info_path, "w") as f:
-                # Architecture du modèle
-                f.write("=== Architecture du Modèle ===\n")
-                config_dict = self.model.config.to_dict()
-                for key, value in config_dict.items():
-                    f.write(f"{key}: {value}\n")
-
-                # Paramètres d'entraînement
-                f.write("\n=== Paramètres d'Entraînement ===\n")
-                f.write(f"Learning rate: {self.args.learning_rate}\n")
-                f.write(f"Batch size: {self.args.per_device_train_batch_size}\n")
-                f.write(f"Nombre d'epochs: {self.args.num_train_epochs}\n")
-                f.write(f"Warmup steps: {self.args.warmup_steps}\n")
-                f.write(f"Weight decay: {self.args.weight_decay}\n")
-                f.write(f"Gradient accumulation steps: {self.args.gradient_accumulation_steps}\n")
-                
-                if current_loss is not None:
-                    f.write(f"Current loss: {current_loss}\n")
-                
-                # État actuel
-                f.write(f"\nStep actuel: {self.state.global_step}\n")
-                f.write(f"Epoch actuelle: {self.state.epoch}\n")
-                
-        except Exception as e:
-            self.logger.error(f"Error saving model info: {e}")
-
-    def save_model(self, output_dir=None):
-        """Override pour sauvegarder les poids avec les informations"""
+    def save_model(self, output_dir=None, _internal_call=False):  # Ajout du paramètre _internal_call
+        """Override pour sauvegarder les poids avec les informations finales"""
         # Sauvegarde standard du modèle
-        super().save_model(output_dir)
+        super().save_model(output_dir, _internal_call=_internal_call)
         
         # Sauvegarder une copie dans le dossier weights avec les informations
-        if output_dir:
+        if output_dir and not _internal_call:  # Ne copier dans weights que lors de l'appel final
             try:
                 # Copier les poids
-                shutil.copytree(output_dir, self.weights_dir, dirs_exist_ok=True)
+                for file_name in os.listdir(output_dir):
+                    src_path = os.path.join(output_dir, file_name)
+                    dst_path = os.path.join(self.weights_dir, file_name)
+                    if os.path.isfile(src_path):
+                        shutil.copy2(src_path, dst_path)
+                
                 # Sauvegarder les informations finales
                 self._save_model_info(self.weights_dir)
+                
             except Exception as e:
                 self.logger.error(f"Error saving final weights: {e}")
 
@@ -175,27 +183,42 @@ class TrainingConfig:
         self.model_config = model_config
         self.data_loader = data_loader
         self.trainer = None
-        # Initialisation des training_args avec des valeurs par défaut
-        self.training_args = TrainerArguments(
-            output_dir="camembert-fr",
-            use_cuda=True  # valeur par défaut
-        )
         self.model = None
-        self.device = self._setup_device()
         
+        # Définir la structure des dossiers
+        self.base_dir = "camembert-training"
+        self.run_dir = self._setup_run_dir()
+        
+        # Initialisation des training_args AVANT _setup_device
+        self.training_args = TrainerArguments(
+            output_dir=self.run_dir,
+            use_cuda=True,
+            num_train_epochs=3,
+            per_device_train_batch_size=16,
+            learning_rate=5e-5,
+            weight_decay=0.01,
+            warmup_steps=10000,
+            logging_steps=500,
+            save_steps=5000,
+            max_steps=100000,
+            gradient_accumulation_steps=4
+        )
+        
+        # Maintenant on peut initialiser le device
+        self.device = self._setup_device()
+
     def _setup_device(self) -> torch.device:
         """Configure the device (CPU/GPU) for training"""
-        if not self.training_args.use_cuda:
+        if not hasattr(self, 'training_args') or not self.training_args.use_cuda:
             self.logger.info("CUDA usage disabled by configuration")
             return torch.device("cpu")
             
         if torch.cuda.is_available():
             device = torch.device("cuda")
             gpu_name = torch.cuda.get_device_name(0)
-            gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3  # Convert to GB
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
             self.logger.info(f"Using GPU: {gpu_name} with {gpu_memory:.2f}GB memory")
             
-            # Optimize CUDA performance
             torch.backends.cudnn.benchmark = True
             torch.backends.cudnn.deterministic = False
             
@@ -203,6 +226,55 @@ class TrainingConfig:
         else:
             self.logger.warning("CUDA not available, falling back to CPU")
             return torch.device("cpu")
+
+    def _setup_run_dir(self) -> str:
+        """Configure le prochain dossier de run disponible"""
+        os.makedirs(self.base_dir, exist_ok=True)
+        i = 0
+        while True:
+            run_dir = os.path.join(self.base_dir, f"cam_run{i}")
+            if not os.path.exists(run_dir):
+                os.makedirs(run_dir)
+                os.makedirs(os.path.join(run_dir, "weights"))
+                return run_dir
+            i += 1
+
+    def setup_training_arguments(self, **kwargs) -> None:
+        """Setup training arguments avec le bon chemin"""
+        try:
+            # Mise à jour des arguments avec les kwargs fournis
+            for key, value in kwargs.items():
+                if hasattr(self.training_args, key):
+                    setattr(self.training_args, key, value)
+
+            # S'assurer que output_dir pointe vers le bon run
+            self.training_args.output_dir = self.run_dir
+            
+            # Créer HuggingFace training arguments
+            run_name = f"training-{os.path.basename(self.run_dir)}-{wandb.util.generate_id()}"
+            
+            # Conversion en HuggingFace TrainingArguments
+            self.training_args = TrainingArguments(
+                output_dir=self.training_args.output_dir,
+                num_train_epochs=self.training_args.num_train_epochs,
+                per_device_train_batch_size=self.training_args.per_device_train_batch_size,
+                learning_rate=self.training_args.learning_rate,
+                weight_decay=self.training_args.weight_decay,
+                warmup_steps=self.training_args.warmup_steps,
+                logging_steps=self.training_args.logging_steps,
+                save_steps=self.training_args.save_steps,
+                max_steps=self.training_args.max_steps,
+                gradient_accumulation_steps=self.training_args.gradient_accumulation_steps,
+                run_name=run_name,
+                report_to="wandb",
+                fp16=self.device.type == "cuda",
+                dataloader_num_workers=4 if self.device.type == "cuda" else 0,
+                dataloader_pin_memory=self.device.type == "cuda"
+            )
+        except Exception as e:
+            self.logger.error(f"Error setting up training arguments: {e}")
+            raise
+
 
     def initialize_model(self) -> None:
         """Initialize RoBERTa model with config and move to appropriate device"""
@@ -226,47 +298,6 @@ class TrainingConfig:
             self.logger.error(f"Error initializing model: {e}")
             raise
 
-    def setup_training_arguments(self, **kwargs) -> None:
-        """Setup training arguments with custom parameters"""
-        try:
-            # Update training arguments with provided kwargs
-            for key, value in kwargs.items():
-                if hasattr(self.training_args, key):
-                    setattr(self.training_args, key, value)
-
-            # Create HuggingFace training arguments
-            run_name = f"training-run-{self.training_args.output_dir}-{wandb.util.generate_id()}"
-            
-            # Adjust batch size based on GPU memory if using CUDA
-            if self.device.type == "cuda":
-                gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3  # GB
-                if gpu_memory >= 40:  
-                    self.training_args.per_device_train_batch_size *= 2
-                    self.logger.info(f"Increased batch size to {self.training_args.per_device_train_batch_size} "
-                                   f"due to large GPU memory")
-
-            self.training_args = TrainingArguments(
-                output_dir=self.training_args.output_dir,
-                num_train_epochs=self.training_args.num_train_epochs,
-                per_device_train_batch_size=self.training_args.per_device_train_batch_size,
-                learning_rate=self.training_args.learning_rate,
-                weight_decay=self.training_args.weight_decay,
-                warmup_steps=self.training_args.warmup_steps,
-                logging_steps=self.training_args.logging_steps,
-                save_steps=self.training_args.save_steps,
-                max_steps=self.training_args.max_steps,
-                gradient_accumulation_steps=self.training_args.gradient_accumulation_steps,
-                run_name=run_name,
-                report_to="wandb",
-                # GPU specific arguments
-                fp16=self.device.type == "cuda",  # Enable mixed precision training on GPU
-                dataloader_num_workers=4 if self.device.type == "cuda" else 0,  # Use multiple workers on GPU
-                dataloader_pin_memory=self.device.type == "cuda",  # Pin memory for faster data transfer to GPU
-            )
-
-        except Exception as e:
-            self.logger.error(f"Error setting up training arguments: {e}")
-            raise
 
     def setup_trainer(self, callback: Optional[TrainerCallback] = None) -> None:
         """Configuration complète du trainer avec monitoring"""
@@ -291,6 +322,7 @@ class TrainingConfig:
 
             # Création du trainer
             self.trainer = CustomTrainer(
+                dataset_size=self.data_loader.get_dataset_size(),  # Ajout de la taille du dataset
                 model=self.model,
                 args=self.training_args,
                 train_dataset=self.data_loader.dataset,

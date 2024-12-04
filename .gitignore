@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 checkpoints/
 wandb/
+camembert-training/
 
 # C extensions
 *.so

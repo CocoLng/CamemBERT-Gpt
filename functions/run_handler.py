@@ -212,7 +212,7 @@ class Run_Handler:
                     with gr.Column():
                         # Model training parameters
                         output_dir = gr.Textbox(
-                            value="camembert-fr", label="Dossier de Sortie"
+                            value="camembert-training", label="Dossier de Sortie"
                         )
                         num_train_epochs = gr.Slider(
                             minimum=1,
@@ -279,7 +279,7 @@ class Run_Handler:
 
                 with gr.Row():
                     wandb_project = gr.Textbox(
-                        value="camembert-fr", label="Nom du Projet W&B"
+                        value="camembert-training", label="Nom du Projet W&B"
                     )
 
                 with gr.Row():
