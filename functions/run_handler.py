@@ -3,12 +3,10 @@ import logging
 import gradio as gr
 from typing import Tuple
 
-import wandb
-
 from .data_loader import DataLoader
 from .model_config import ModelConfig
 from .test_predictor import TestPredictor
-from .train import GradioTrainingCallback, TrainingConfig
+from .train import TrainingConfig
 
 
 class Run_Handler:
@@ -289,11 +287,6 @@ class Run_Handler:
                         label="Statut de l'Entraînement", interactive=False
                     )
 
-                with gr.Row():
-                    # Progress monitoring
-                    training_progress = gr.Plot(label="Courbe d'Apprentissage")
-                    current_metrics = gr.JSON(label="Métriques Actuelles")
-
             # 4& 5  nouvel onglet de test
             with gr.Tab("4. Test du Modèle"):
                 gr.Markdown("### Test de Génération de Texte")
@@ -397,75 +390,8 @@ class Run_Handler:
             )
 
             # Events for Tab 3
-            def start_training(
-                output_dir,
-                num_train_epochs,
-                batch_size,
-                learning_rate,
-                weight_decay,
-                warmup_steps,
-                gradient_accumulation,
-                wandb_project,
-                use_cuda,
-                fp16_training,
-                num_workers,
-            ):
-                try:
-                    if not self.training_config:
-                        return (
-                            "❌ Veuillez d'abord initialiser la configuration du modèle"
-                        )
-
-                    # Initialize wandb
-                    wandb.init(project=wandb_project, name=f"training-run-{output_dir}")
-
-                    # Setup training arguments
-                    self.training_config.training_args.use_cuda = use_cuda
-                    self.training_config.setup_training_arguments(
-                        output_dir=output_dir,
-                        num_train_epochs=int(num_train_epochs),
-                        per_device_train_batch_size=int(batch_size),
-                        learning_rate=float(learning_rate),
-                        weight_decay=float(weight_decay),
-                        warmup_steps=int(warmup_steps),
-                        gradient_accumulation_steps=int(gradient_accumulation),
-                        fp16=fp16_training and use_cuda,
-                        dataloader_num_workers=int(num_workers),
-                    )
-
-                    # Setup trainer with callback
-                    callback = GradioTrainingCallback(
-                        training_progress, current_metrics
-                    )
-                    self.training_config.setup_trainer(callback)
-
-                    # Start training in a separate thread
-                    import threading
-
-                    self.training_thread = threading.Thread(
-                        target=self.training_config.train
-                    )
-                    self.training_thread.start()
-
-                    return "✅ Entraînement démarré!"
-                except Exception as e:
-                    return f"❌ Erreur lors du démarrage: {str(e)}"
-
-            def stop_training():
-                try:
-                    if (
-                        hasattr(self, "training_thread")
-                        and self.training_thread.is_alive()
-                    ):
-                        # Implement graceful shutdown
-                        wandb.finish()
-                        return "✅ Arrêt de l'entraînement demandé"
-                    return "❌ Aucun entraînement en cours"
-                except Exception as e:
-                    return f"❌ Erreur lors de l'arrêt: {str(e)}"
-
             start_training_btn.click(
-                fn=start_training,
+                fn=lambda *args: self.training_config.start_training(*args) if self.training_config else "❌ Configuration non initialisée",
                 inputs=[
                     output_dir,
                     num_train_epochs,
@@ -482,7 +408,10 @@ class Run_Handler:
                 outputs=[training_status],
             )
 
-            stop_training_btn.click(fn=stop_training, outputs=[training_status])
+            stop_training_btn.click(
+                fn=lambda: self.training_config.stop_training() if self.training_config else "❌ Configuration non initialisée",
+                outputs=[training_status],
+            )
 
             return interface
 

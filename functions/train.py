@@ -4,10 +4,11 @@ from transformers import Trainer, TrainingArguments, TrainerCallback, RobertaFor
 import matplotlib.pyplot as plt
 import torch
 import wandb
-from typing import List, Optional
+from typing import Optional
 from .masking_monitor import MaskingMonitorCallback
 import os
 import shutil
+import threading
 
 
 class GradioTrainingCallback(TrainerCallback):
@@ -74,8 +75,11 @@ class CustomTrainer(Trainer):
             kwargs.pop('tokenizer')
         super().__init__(**kwargs)
         
+        # Ajout de l'event pour le stop
+        self.stop_event = threading.Event()
+        
         # Modifier la fréquence des checkpoints
-        self.args.save_steps = 5000
+        self.args.save_steps = 10
         
         # Le dossier weights est déjà créé dans le run_dir
         self.weights_dir = os.path.join(self.args.output_dir, "weights")
@@ -117,7 +121,17 @@ class CustomTrainer(Trainer):
             self.logger.error(f"Error saving model info: {e}")
 
     def training_step(self, model, inputs, num_items_in_batch=None):
+        """Étape d'entraînement avec gestion propre de l'arrêt"""
         try:
+            # Vérifier si l'arrêt a été demandé
+            if self.stop_event.is_set():
+                # Sauvegarder l'état actuel
+                self.save_model()
+                if wandb.run is not None:
+                    wandb.finish()
+                # Retourner une loss valide mais qui indiquera l'arrêt
+                return torch.tensor(0.0, device=self.args.device)
+
             # Vérifier les clés nécessaires
             required_keys = {'input_ids', 'attention_mask', 'labels'}
             if not all(k in inputs for k in required_keys):
@@ -143,6 +157,7 @@ class CustomTrainer(Trainer):
             raise
 
     def _save_loss_history(self, checkpoint_dir: str, current_loss: float):
+        """Sauvegarde l'historique des pertes"""
         try:
             loss_file = os.path.join(checkpoint_dir, "loss_history.txt")
             with open(loss_file, "w") as f:
@@ -156,8 +171,8 @@ class CustomTrainer(Trainer):
         except Exception as e:
             self.logger.error(f"Error saving loss history: {e}")
 
-    def save_model(self, output_dir=None, _internal_call=False):  # Ajout du paramètre _internal_call
-        """Override pour sauvegarder les poids avec les informations finales"""
+    def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
+        """Sauvegarde le modèle avec gestion améliorée des poids"""
         # Sauvegarde standard du modèle
         super().save_model(output_dir, _internal_call=_internal_call)
         
@@ -177,6 +192,18 @@ class CustomTrainer(Trainer):
             except Exception as e:
                 self.logger.error(f"Error saving final weights: {e}")
 
+    def stop_training(self):
+        """Méthode pour arrêter proprement l'entraînement"""
+        self.logger.info("Stopping training...")
+        # Signal l'arrêt
+        self.stop_event.set()
+        
+        # Sauvegarde l'état actuel
+        try:
+            self.save_model()
+        except Exception as e:
+            self.logger.error(f"Error saving model during stop: {e}")
+
 class TrainingConfig:
     def __init__(self, model_config, data_loader):
         self.logger = logging.getLogger(__name__)
@@ -189,10 +216,13 @@ class TrainingConfig:
         self.base_dir = "camembert-training"
         self.run_dir = self._setup_run_dir()
         
-        # Initialisation des training_args AVANT _setup_device
-        self.training_args = TrainerArguments(
+        # Set device before training args
+        self.device = self._setup_device()
+        
+        # Initialize default training args
+        run_name = f"training-{os.path.basename(self.run_dir)}-{wandb.util.generate_id()}"
+        self.training_args = TrainingArguments(
             output_dir=self.run_dir,
-            use_cuda=True,
             num_train_epochs=3,
             per_device_train_batch_size=16,
             learning_rate=5e-5,
@@ -201,18 +231,20 @@ class TrainingConfig:
             logging_steps=500,
             save_steps=5000,
             max_steps=100000,
-            gradient_accumulation_steps=4
+            gradient_accumulation_steps=4,
+            fp16=(self.device.type == "cuda"),
+            dataloader_num_workers=4 if self.device.type == "cuda" else 0,
+            dataloader_pin_memory=(self.device.type == "cuda"),
+            run_name=run_name,
+            report_to="wandb"
         )
-        
-        # Maintenant on peut initialiser le device
-        self.device = self._setup_device()
+
+        # Initialize model right away if model_config is ready
+        if self.model_config and self.model_config.config:
+            self.initialize_model()
 
     def _setup_device(self) -> torch.device:
         """Configure the device (CPU/GPU) for training"""
-        if not hasattr(self, 'training_args') or not self.training_args.use_cuda:
-            self.logger.info("CUDA usage disabled by configuration")
-            return torch.device("cpu")
-            
         if torch.cuda.is_available():
             device = torch.device("cuda")
             gpu_name = torch.cuda.get_device_name(0)
@@ -275,7 +307,6 @@ class TrainingConfig:
             self.logger.error(f"Error setting up training arguments: {e}")
             raise
 
-
     def initialize_model(self) -> None:
         """Initialize RoBERTa model with config and move to appropriate device"""
         try:
@@ -285,21 +316,16 @@ class TrainingConfig:
             self.model = RobertaForMaskedLM(self.model_config.config)
             self.model.to(self.device)
             
-            # Log model device placement and memory usage
-            if self.device.type == "cuda":
-                memory_allocated = torch.cuda.memory_allocated(0) / 1024**2  # MB
-                memory_reserved = torch.cuda.memory_reserved(0) / 1024**2  # MB
-                self.logger.info(f"Model moved to GPU. Allocated memory: {memory_allocated:.2f}MB, "
-                               f"Reserved memory: {memory_reserved:.2f}MB")
+            # Setup initial trainer with default args
+            self.setup_trainer()
             
-            self.logger.info("Model initialized successfully on device: " + str(self.device))
+            self.logger.info("Model and trainer initialized successfully on device: " + str(self.device))
 
         except Exception as e:
             self.logger.error(f"Error initializing model: {e}")
             raise
 
-
-    def setup_trainer(self, callback: Optional[TrainerCallback] = None) -> None:
+    def setup_trainer(self, callback=None):
         """Configuration complète du trainer avec monitoring"""
         try:
             # Vérifications préliminaires
@@ -316,13 +342,13 @@ class TrainingConfig:
             )
 
             # Préparation des callbacks
-            callbacks: List[TrainerCallback] = [self.masking_monitor]
+            callbacks = [self.masking_monitor]
             if callback:
                 callbacks.append(callback)
 
-            # Création du trainer
+            # Création d'une nouvelle instance du trainer
             self.trainer = CustomTrainer(
-                dataset_size=self.data_loader.get_dataset_size(),  # Ajout de la taille du dataset
+                dataset_size=self.data_loader.get_dataset_size(),
                 model=self.model,
                 args=self.training_args,
                 train_dataset=self.data_loader.dataset,
@@ -353,7 +379,7 @@ class TrainingConfig:
 
             # Vérifier le masquage sur le batch d'exemple
             self.masking_monitor.analyze_batch(collated_batch)
-            stats = self.masking_monitor.get_stats_dict()  # Utilisation du bon nom de méthode
+            stats = self.masking_monitor.get_stats_dict()
             
             self.logger.info(
                 f"Vérification du setup:\n"
@@ -368,30 +394,81 @@ class TrainingConfig:
     def train(self) -> None:
         """Start the training process"""
         try:
-            if not self.trainer:
+            if not hasattr(self, 'trainer') or self.trainer is None:
                 raise ValueError("Trainer not initialized")
 
-            # Log GPU memory usage before training
-            if self.device.type == "cuda":
-                memory_allocated = torch.cuda.memory_allocated(0) / 1024**2  # MB
-                memory_reserved = torch.cuda.memory_reserved(0) / 1024**2  # MB
-                self.logger.info(f"Pre-training GPU memory - Allocated: {memory_allocated:.2f}MB, "
-                               f"Reserved: {memory_reserved:.2f}MB")
-
-            # Start training
+            self.setup_trainer()
             self.trainer.train()
-
-            # Save the final model
             self.trainer.save_model()
             self.logger.info("Training completed successfully")
 
-            # Log final GPU memory usage
-            if self.device.type == "cuda":
-                memory_allocated = torch.cuda.memory_allocated(0) / 1024**2  # MB
-                memory_reserved = torch.cuda.memory_reserved(0) / 1024**2  # MB
-                self.logger.info(f"Post-training GPU memory - Allocated: {memory_allocated:.2f}MB, "
-                               f"Reserved: {memory_reserved:.2f}MB")
-
         except Exception as e:
             self.logger.error(f"Error during training: {e}")
+            if hasattr(self, 'trainer') and self.trainer is not None:
+                self.trainer.save_model()
             raise
+
+    def start_training(self, output_dir, num_train_epochs, batch_size, learning_rate,
+                      weight_decay, warmup_steps, gradient_accumulation,
+                      wandb_project, use_cuda, fp16_training, num_workers):
+        """Centralised method to start training"""
+        try:
+            if not self.trainer:
+                return "❌ Veuillez d'abord initialiser la configuration du modèle"
+
+            # Initialize wandb
+            wandb.init(project=wandb_project, name=f"training-run-{output_dir}")
+
+            # Setup training arguments
+            self.setup_training_arguments(
+                output_dir=output_dir,
+                num_train_epochs=int(num_train_epochs),
+                per_device_train_batch_size=int(batch_size),
+                learning_rate=float(learning_rate),
+                weight_decay=float(weight_decay),
+                warmup_steps=int(warmup_steps),
+                gradient_accumulation_steps=int(gradient_accumulation),
+                fp16=fp16_training and use_cuda,
+                dataloader_num_workers=int(num_workers),
+            )
+
+            # Start training directly
+            self.train()
+            return "✅ Entraînement démarré!"
+
+        except Exception as e:
+            self.logger.error(f"Error starting training: {e}")
+            return f"❌ Erreur lors du démarrage: {str(e)}"
+
+    def stop_training(self):
+        """Arrête tout le programme de manière forcée"""
+        try:
+            self.logger.info("Stopping training and cleaning up...")
+            
+            # 1. Nettoyage de wandb
+            if wandb.run is not None:
+                wandb.finish()
+            
+            # 2. Obtenir le PID du processus principal
+            import os
+            import signal
+            main_pid = os.getpid()
+            
+            # 3. Trouver et terminer tous les processus enfants
+            import psutil
+            parent = psutil.Process(main_pid)
+            for child in parent.children(recursive=True):
+                try:
+                    child.kill()
+                except psutil.NoSuchProcess:
+                    pass
+                    
+            # 4. Envoyer SIGKILL au processus principal
+            self.logger.info("Forcing program exit...")
+            os.kill(main_pid, signal.SIGKILL)
+            
+        except Exception as e:
+            self.logger.error(f"Error during cleanup and exit: {e}")
+            # Si tout échoue, on force quand même l'arrêt
+            import sys
+            sys.exit(1)
