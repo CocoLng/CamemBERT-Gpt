@@ -27,7 +27,7 @@ class DataLoader:
             total_tokens = int(size_gb * tokens_per_gb)
 
             self.dataset = load_dataset(
-                "oscar-corpus/OSCAR-2301", "fr", split="train", streaming=True
+                "oscar-corpus/OSCAR-2301", "fr", split="train", streaming=True, trust_remote_code=True
             ).take(total_tokens)
 
             # Transform dataset to include tokenized inputs
