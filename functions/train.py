@@ -4,6 +4,11 @@ from transformers import Trainer, TrainingArguments, TrainerCallback, RobertaFor
 import matplotlib.pyplot as plt
 import torch
 import wandb
+from typing import List, Optional
+from .masking_monitor import MaskingMonitorCallback
+import os
+import shutil
+
 
 class GradioTrainingCallback(TrainerCallback):
     def __init__(self, plot_component, metrics_component):
@@ -62,11 +67,107 @@ class TrainerArguments:
     use_cuda: bool = True  # New parameter to control CUDA usage
 
 class CustomTrainer(Trainer):
+    """Custom trainer with enhanced error handling and monitoring"""
+    
     def __init__(self, **kwargs):
-        if 'tokenizer' in kwargs:
-            kwargs.pop('tokenizer')  # Remove tokenizer from kwargs
-        super().__init__(**kwargs)
         self.logger = logging.getLogger(__name__)
+        if 'tokenizer' in kwargs:
+            kwargs.pop('tokenizer')
+        super().__init__(**kwargs)
+        
+        # Modifier la fréquence des checkpoints
+        self.args.save_steps = 5000  # Changement de 10000 à 5000
+        
+        # Créer les dossiers nécessaires
+        self.weights_dir = os.path.join(self.args.output_dir, "weights")
+        os.makedirs(self.weights_dir, exist_ok=True)
+        
+        # Sauvegarder la configuration initiale
+        self._save_model_info(self.args.output_dir)
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        """Override training step avec logging des losses"""
+        try:
+            # Vérifier les clés nécessaires
+            required_keys = {'input_ids', 'attention_mask', 'labels'}
+            if not all(k in inputs for k in required_keys):
+                missing = required_keys - set(inputs.keys())
+                raise ValueError(f"Missing required keys in inputs: {missing}")
+
+            # Mettre les tenseurs sur le bon device
+            inputs = {k: v.to(model.device) for k, v in inputs.items()}
+            
+            # Calcul de la loss
+            loss = super().training_step(model, inputs, num_items_in_batch)
+            
+            # Enregistrer la loss dans le fichier de log
+            if self.state.global_step % self.args.logging_steps == 0:
+                self._log_loss(loss.item())
+
+            # À chaque checkpoint, sauvegarder les informations
+            if self.state.global_step % self.args.save_steps == 0:
+                checkpoint_dir = os.path.join(self.args.output_dir, f"checkpoint-{self.state.global_step}")
+                self._save_model_info(checkpoint_dir, loss.item())
+                
+            return loss
+            
+        except Exception as e:
+            self.logger.error(f"Error in training_step: {e}")
+            raise
+
+    def _log_loss(self, loss: float):
+        """Enregistre la loss dans un fichier"""
+        log_path = os.path.join(self.args.output_dir, "loss_history.txt")
+        try:
+            with open(log_path, "a") as f:
+                f.write(f"Step {self.state.global_step}: {loss}\n")
+        except Exception as e:
+            self.logger.error(f"Error logging loss: {e}")
+
+    def _save_model_info(self, directory: str, current_loss: float = None):
+        """Sauvegarde les informations du modèle"""
+        try:
+            info_path = os.path.join(directory, "model_info.txt")
+            with open(info_path, "w") as f:
+                # Architecture du modèle
+                f.write("=== Architecture du Modèle ===\n")
+                config_dict = self.model.config.to_dict()
+                for key, value in config_dict.items():
+                    f.write(f"{key}: {value}\n")
+
+                # Paramètres d'entraînement
+                f.write("\n=== Paramètres d'Entraînement ===\n")
+                f.write(f"Learning rate: {self.args.learning_rate}\n")
+                f.write(f"Batch size: {self.args.per_device_train_batch_size}\n")
+                f.write(f"Nombre d'epochs: {self.args.num_train_epochs}\n")
+                f.write(f"Warmup steps: {self.args.warmup_steps}\n")
+                f.write(f"Weight decay: {self.args.weight_decay}\n")
+                f.write(f"Gradient accumulation steps: {self.args.gradient_accumulation_steps}\n")
+                
+                if current_loss is not None:
+                    f.write(f"Current loss: {current_loss}\n")
+                
+                # État actuel
+                f.write(f"\nStep actuel: {self.state.global_step}\n")
+                f.write(f"Epoch actuelle: {self.state.epoch}\n")
+                
+        except Exception as e:
+            self.logger.error(f"Error saving model info: {e}")
+
+    def save_model(self, output_dir=None):
+        """Override pour sauvegarder les poids avec les informations"""
+        # Sauvegarde standard du modèle
+        super().save_model(output_dir)
+        
+        # Sauvegarder une copie dans le dossier weights avec les informations
+        if output_dir:
+            try:
+                # Copier les poids
+                shutil.copytree(output_dir, self.weights_dir, dirs_exist_ok=True)
+                # Sauvegarder les informations finales
+                self._save_model_info(self.weights_dir)
+            except Exception as e:
+                self.logger.error(f"Error saving final weights: {e}")
 
 class TrainingConfig:
     def __init__(self, model_config, data_loader):
@@ -74,7 +175,11 @@ class TrainingConfig:
         self.model_config = model_config
         self.data_loader = data_loader
         self.trainer = None
-        self.training_args = TrainerArguments()
+        # Initialisation des training_args avec des valeurs par défaut
+        self.training_args = TrainerArguments(
+            output_dir="camembert-fr",
+            use_cuda=True  # valeur par défaut
+        )
         self.model = None
         self.device = self._setup_device()
         
@@ -163,16 +268,28 @@ class TrainingConfig:
             self.logger.error(f"Error setting up training arguments: {e}")
             raise
 
-    def setup_trainer(self, callback=None) -> None:
-        """Setup trainer with model and data collator"""
+    def setup_trainer(self, callback: Optional[TrainerCallback] = None) -> None:
+        """Configuration complète du trainer avec monitoring"""
         try:
+            # Vérifications préliminaires
+            if not self.data_loader.is_ready():
+                raise ValueError("Dataset non chargé. Chargez le dataset avant l'entraînement.")
+
             if not self.model:
                 self.initialize_model()
 
-            callbacks = []
+            # Configuration du monitoring de masquage
+            self.masking_monitor = MaskingMonitorCallback(
+                tokenizer=self.data_loader.tokenizer,
+                expected_mlm_probability=self.data_loader.mlm_probability
+            )
+
+            # Préparation des callbacks
+            callbacks: List[TrainerCallback] = [self.masking_monitor]
             if callback:
                 callbacks.append(callback)
 
+            # Création du trainer
             self.trainer = CustomTrainer(
                 model=self.model,
                 args=self.training_args,
@@ -181,8 +298,39 @@ class TrainingConfig:
                 callbacks=callbacks
             )
 
+            # Vérification finale
+            self._verify_training_setup()
+
+            self.logger.info("✅ Trainer configuré avec succès!")
+
         except Exception as e:
-            self.logger.error(f"Error setting up trainer: {e}")
+            self.logger.error(f"❌ Erreur lors de la configuration du trainer: {e}")
+            raise
+
+    def _verify_training_setup(self) -> None:
+        """Vérifie la configuration complète de l'entraînement"""
+        try:
+            # Vérifier un batch d'exemple
+            sample_batch = next(iter(self.data_loader.dataset))
+            collated_batch = self.data_loader.data_collator([sample_batch])
+            
+            # Vérifier la présence des tenseurs requis
+            required_keys = {'input_ids', 'attention_mask', 'labels'}
+            if not all(k in collated_batch for k in required_keys):
+                raise ValueError(f"Batch invalide. Clés manquantes: {required_keys - set(collated_batch.keys())}")
+
+            # Vérifier le masquage sur le batch d'exemple
+            self.masking_monitor.analyze_batch(collated_batch)
+            stats = self.masking_monitor.get_stats_dict()  # Utilisation du bon nom de méthode
+            
+            self.logger.info(
+                f"Vérification du setup:\n"
+                f"- Ratio de masquage test: {stats['current_masking_ratio']:.2%}\n"
+                f"- Ratio attendu: {stats['expected_ratio']:.2%}"
+            )
+
+        except Exception as e:
+            self.logger.error(f"Erreur lors de la vérification du setup: {e}")
             raise
 
     def train(self) -> None:

@@ -1,13 +1,14 @@
 import logging
 
 import gradio as gr
+from typing import Tuple
 
 import wandb
 
 from .data_loader import DataLoader
 from .model_config import ModelConfig
 from .test_predictor import TestPredictor
-from .training_config import GradioTrainingCallback, TrainingConfig
+from .train import GradioTrainingCallback, TrainingConfig
 
 
 class Run_Handler:
@@ -23,7 +24,6 @@ class Run_Handler:
         with gr.Blocks(title="CamemBERT Training Interface") as interface:
             gr.Markdown("# 🧀 CamemBERT Training Interface")
 
-            # Tab 1: Data Loading (existing code)
             with gr.Tab("1. Chargement & Visualisation des Données"):
                 with gr.Row():
                     dataset_size = gr.Slider(
@@ -31,24 +31,40 @@ class Run_Handler:
                         maximum=100,
                         value=1,
                         step=1,
-                        label="Taille du Dataset (GB)",
+                        label="Taille du Dataset (GB)"
+                    )
+                    masking_prob = gr.Slider(
+                        minimum=0.05,
+                        maximum=0.25,
+                        value=0.15,
+                        step=0.01,
+                        label="Probabilité de Masquage (MLM)"
                     )
                     load_btn = gr.Button("Charger Dataset")
 
                 with gr.Row():
                     load_status = gr.Textbox(
-                        label="Statut du chargement", interactive=False
+                        label="Statut du chargement",
+                        interactive=False
                     )
 
                 gr.Markdown("### Test de Masquage")
                 with gr.Row():
-                    input_text = gr.Textbox(
-                        label="Texte d'entrée (laissez vide pour un texte aléatoire)",
-                        placeholder="Entrez un texte en français...",
-                        lines=3,
-                    )
-                    visualize_btn = gr.Button("Visualiser le Masquage")
-
+                    masking_input = gr.Textbox(  # Renommé pour clarté
+                    label="Texte d'entrée (laissez vide pour un texte aléatoire)",
+                    placeholder="Entrez un texte en français...",
+                    lines=3,
+                )
+                text_density = gr.Slider(
+                    minimum=0.1,
+                    maximum=1.0,
+                    value=0.6,
+                    step=0.05,
+                    label="Densité minimale de texte",
+                    info="Ratio minimum de tokens réels vs padding"
+                )
+                visualize_btn = gr.Button("Visualiser le Masquage")
+                
                 with gr.Row():
                     with gr.Column():
                         original_text = gr.Textbox(
@@ -355,17 +371,29 @@ class Run_Handler:
                     outputs=[predicted_text, predictions_display],
                 )
 
-            # Events for Tab 1 (existing)
-            load_btn.click(
-                fn=self.data_loader.load_streaming_dataset,
-                inputs=[dataset_size],
-                outputs=[load_status],
+            # Events for Tab 1
+            def visualize_with_density(text: str, density: float) -> Tuple[str, str]:
+                if text.strip():
+                    return self.data_loader.visualize_masking(text)  # Utiliser direct_masking
+                else:
+                    random_text = self.data_loader.get_random_text(min_density=float(density))
+                    return self.data_loader.visualize_masking(random_text)
+
+            # Connecter l'événement immédiatement après la définition de la fonction
+            visualize_btn.click(
+                fn=visualize_with_density,
+                inputs=[masking_input, text_density],  # Utiliser masking_input au lieu de input_text
+                outputs=[original_text, masked_text],
             )
 
-            visualize_btn.click(
-                fn=self.data_loader.visualize_masking,
-                inputs=[input_text],
-                outputs=[original_text, masked_text],
+            def load_dataset_with_masking(size, prob):
+                self.data_loader.set_mlm_probability(prob)
+                return self.data_loader.load_streaming_dataset(size)
+
+            load_btn.click(
+                fn=load_dataset_with_masking,
+                inputs=[dataset_size, masking_prob],
+                outputs=[load_status]
             )
 
             # Events for Tab 3
