@@ -9,6 +9,14 @@ from transformers import DataCollatorForLanguageModeling, RobertaTokenizerFast
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 @dataclass
+class MaskingStats:
+    """Structure for masking statistics"""
+    average_ratio: float
+    num_samples: int
+    expected_ratio: float
+    deviation: float
+
+@dataclass
 class MaskingResult:
     """Structure for masking results with clear metrics"""
     original_text: str
@@ -16,14 +24,6 @@ class MaskingResult:
     masking_ratio: float
     num_masked_tokens: int
     total_tokens: int
-
-@dataclass
-class MaskingStats:
-    """Structure for masking statistics"""
-    average_ratio: float
-    num_samples: int
-    expected_ratio: float
-    deviation: float
 
 class DataLoader:
     def __init__(self):
@@ -35,17 +35,19 @@ class DataLoader:
         self.vocab_size = None
         self.data_collator = None
         self._last_masking_stats = None
+        self._max_length = 512
+        self._padding_token_id = 1  # RoBERTa padding token id
 
     def _initialize_tokenizer(self, vocab_size: int = 50265) -> RobertaTokenizerFast:
         """Initialize RoBERTa tokenizer with error handling and vocab size check"""
         try:
             self.vocab_size = vocab_size
             tokenizer = RobertaTokenizerFast.from_pretrained("roberta-base")
-            # Resize le vocabulaire si nécessaire
+            
             if vocab_size != len(tokenizer):
                 tokenizer = RobertaTokenizerFast.from_pretrained(
                     "roberta-base",
-                    model_max_length=512,
+                    model_max_length=self._max_length,
                     vocab_size=vocab_size
                 )
             self.tokenizer = tokenizer
@@ -54,31 +56,108 @@ class DataLoader:
             self.logger.error(f"Failed to initialize tokenizer: {e}")
             raise
 
+    def _safe_truncate_or_pad(self, token_ids: List[int], max_length: int) -> List[int]:
+        """Safely truncate or pad token ids to exactly max_length"""
+        if len(token_ids) > max_length:
+            return token_ids[:max_length]
+        else:
+            return token_ids + [self._padding_token_id] * (max_length - len(token_ids))
+
+    def _validate_token_ids(self, token_ids: List[int]) -> bool:
+        """Validate that all token ids are within vocabulary range"""
+        if not self.vocab_size:
+            return False
+        return all(0 <= tid < self.vocab_size for tid in token_ids)
+
+    def _process_text(self, examples: Dict) -> Dict:
+        """Process text with thorough validation and error handling"""
+        try:
+            # Tokenize with truncation but without padding first
+            tokenized = self.tokenizer(
+                examples["text"],
+                truncation=True,
+                max_length=self._max_length,
+                padding=False,
+                return_special_tokens_mask=True
+            )
+
+            # Process each sequence individually
+            processed_sequences = []
+            attention_masks = []
+            special_tokens_masks = []
+
+            for idx in range(len(tokenized['input_ids'])):
+                # Get sequence
+                sequence = tokenized['input_ids'][idx]
+                
+                # Validate token ids
+                if not self._validate_token_ids(sequence):
+                    self.logger.warning(f"Invalid token ids found in sequence {idx}, fixing...")
+                    sequence = [tid if tid < self.vocab_size else self.tokenizer.unk_token_id 
+                              for tid in sequence]
+
+                # Safe truncation/padding
+                padded_sequence = self._safe_truncate_or_pad(sequence, self._max_length)
+                attention_mask = [1] * len(sequence)
+                attention_mask = self._safe_truncate_or_pad(attention_mask, self._max_length)
+                
+                # Handle special tokens mask
+                special_tokens_mask = tokenized['special_tokens_mask'][idx]
+                special_tokens_mask = self._safe_truncate_or_pad(special_tokens_mask, self._max_length)
+
+                processed_sequences.append(padded_sequence)
+                attention_masks.append(attention_mask)
+                special_tokens_masks.append(special_tokens_mask)
+
+            return {
+                'input_ids': processed_sequences,
+                'attention_mask': attention_masks,
+                'special_tokens_mask': special_tokens_masks
+            }
+
+        except Exception as e:
+            self.logger.error(f"Error in text processing: {e}")
+            raise
+
+    def _verify_batch_dimensions(self, batch: Dict[str, torch.Tensor]) -> bool:
+        """Verify that all tensors in a batch have correct dimensions"""
+        expected_keys = {'input_ids', 'attention_mask', 'labels'}
+        if not all(key in batch for key in expected_keys):
+            return False
+            
+        shapes = {key: batch[key].shape for key in expected_keys}
+        return all(
+            len(shape) == 2 and shape[1] == self._max_length 
+            for shape in shapes.values()
+        )
+
     def _initialize_data_collator(self) -> DataCollatorForLanguageModeling:
-        """Initialize MLM data collator with current probability and vocab size check"""
+        """Initialize MLM data collator with additional validation"""
         if not self.tokenizer:
             raise ValueError("Tokenizer must be initialized before data collator")
             
-        return DataCollatorForLanguageModeling(
+        collator = DataCollatorForLanguageModeling(
             tokenizer=self.tokenizer,
             mlm=True,
             mlm_probability=self.mlm_probability
         )
+        
+        # Add validation wrapper
+        original_call = collator.__call__
+
+        def validated_call(features):
+            batch = original_call(features)
+            if not self._verify_batch_dimensions(batch):
+                raise ValueError("Invalid batch dimensions after collation")
+            return batch
+
+        collator.__call__ = validated_call
+        return collator
 
     def setup_for_training(self, vocab_size: int):
         """Setup tokenizer and collator with specific vocab size"""
         self._initialize_tokenizer(vocab_size)
         self.data_collator = self._initialize_data_collator()
-
-    def _process_text(self, examples: Dict) -> Dict:
-        
-        return self.tokenizer(
-            examples["text"],
-            truncation=True,
-            max_length=512,
-            padding="max_length",
-            return_special_tokens_mask=True
-        )
 
     def load_with_masking(self, size: float, prob: float, vocab_size: int = None) -> str:
         """Legacy method with vocab size handling"""
