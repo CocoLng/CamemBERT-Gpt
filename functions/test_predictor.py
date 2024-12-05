@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import torch
 
@@ -9,6 +9,28 @@ class TestPredictor:
         self.model = model
         self.tokenizer = tokenizer
         self.logger = logging.getLogger(__name__)
+
+    def predict_and_display(self, text: str, num_tokens: int, top_k: int) -> Tuple[str, str]:
+        """Prédit les tokens et formate l'affichage pour Gradio"""
+        try:
+            # Vérification du modèle
+            if not self.model:
+                return "Erreur: Modèle non initialisé", "Veuillez d'abord configurer et entraîner le modèle"
+
+            # Prédiction
+            predictions, generated_text = self.predict_next_tokens(
+                text, 
+                num_tokens=int(num_tokens), 
+                top_k=int(top_k)
+            )
+
+            # Formatage pour l'affichage
+            formatted_predictions = self.format_predictions_for_display(predictions)
+            return generated_text, formatted_predictions
+
+        except Exception as e:
+            self.logger.error(f"Error in prediction: {e}")
+            return f"Erreur: {str(e)}", "Une erreur est survenue lors de la prédiction"
 
     def get_top_predictions(
         self, input_ids: torch.Tensor, token_index: int, top_k: int = 5

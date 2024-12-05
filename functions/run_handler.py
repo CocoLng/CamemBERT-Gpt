@@ -1,12 +1,9 @@
 import logging
 
 import gradio as gr
-from typing import Tuple
 
 from .data_loader import DataLoader
 from .model_config import ModelConfig
-from .test_predictor import TestPredictor
-from .train import TrainingConfig
 
 
 class Run_Handler:
@@ -29,40 +26,39 @@ class Run_Handler:
                         maximum=100,
                         value=1,
                         step=1,
-                        label="Taille du Dataset (GB)"
+                        label="Taille du Dataset (GB)",
                     )
                     masking_prob = gr.Slider(
                         minimum=0.05,
                         maximum=0.25,
                         value=0.15,
                         step=0.01,
-                        label="Probabilité de Masquage (MLM)"
+                        label="Probabilité de Masquage (MLM)",
                     )
                     load_btn = gr.Button("Charger Dataset")
 
                 with gr.Row():
                     load_status = gr.Textbox(
-                        label="Statut du chargement",
-                        interactive=False
+                        label="Statut du chargement", interactive=False
                     )
 
                 gr.Markdown("### Test de Masquage")
                 with gr.Row():
-                    masking_input = gr.Textbox(  # Renommé pour clarté
-                    label="Texte d'entrée (laissez vide pour un texte aléatoire)",
-                    placeholder="Entrez un texte en français...",
-                    lines=3,
-                )
+                    masking_input = gr.Textbox(
+                        label="Texte d'entrée (laissez vide pour un texte aléatoire)",
+                        placeholder="Entrez un texte en français...",
+                        lines=3,
+                    )
                 text_density = gr.Slider(
                     minimum=0.1,
                     maximum=1.0,
                     value=0.6,
                     step=0.05,
                     label="Densité minimale de texte",
-                    info="Ratio minimum de tokens réels vs padding"
+                    info="Ratio minimum de tokens réels vs padding",
                 )
                 visualize_btn = gr.Button("Visualiser le Masquage")
-                
+
                 with gr.Row():
                     with gr.Column():
                         original_text = gr.Textbox(
@@ -77,7 +73,7 @@ class Run_Handler:
             with gr.Tab("2. Configuration du Modèle"):
                 with gr.Row():
                     with gr.Column():
-                        # Architecture parameters
+                        # Architecture parametres
                         vocab_size = gr.Slider(
                             minimum=10000,
                             maximum=100000,
@@ -143,72 +139,10 @@ class Run_Handler:
                         label="Configuration du Modèle", lines=6, interactive=False
                     )
 
-                def initialize_model_config(
-                    vocab_size,
-                    hidden_size,
-                    num_attention_heads,
-                    num_hidden_layers,
-                    intermediate_size,
-                    hidden_dropout_prob,
-                    attention_probs_dropout_prob,
-                ):
-                    try:
-                        # Validate parameters
-                        if hidden_size % num_attention_heads != 0:
-                            return "❌ Erreur: La dimension des embeddings doit être divisible par le nombre de têtes d'attention"
-
-                        # Initialize configuration
-                        self.model_config.initialize_config(
-                            vocab_size=int(vocab_size),
-                            hidden_size=int(hidden_size),
-                            num_attention_heads=int(num_attention_heads),
-                            num_hidden_layers=int(num_hidden_layers),
-                            intermediate_size=int(intermediate_size),
-                            hidden_dropout_prob=float(hidden_dropout_prob),
-                            attention_probs_dropout_prob=float(
-                                attention_probs_dropout_prob
-                            ),
-                        )
-
-                        # Create formatted status message
-                        status = (
-                            "✅ Configuration du modèle initialisée avec succès!\n\n"
-                        )
-                        status += "Paramètres choisis:\n"
-                        status += f"- Architecture: {num_hidden_layers} couches, {num_attention_heads} têtes d'attention\n"
-                        status += f"- Dimensions: {hidden_size} embeddings, {intermediate_size} intermédiaire\n"
-                        status += f"- Vocabulaire: {vocab_size} tokens\n"
-                        status += f"- Regularisation: {hidden_dropout_prob} dropout, {attention_probs_dropout_prob} attention dropout"
-
-                        # Initialize training config after model config
-                        self.training_config = TrainingConfig(
-                            self.model_config, self.data_loader
-                        )
-
-                        return status
-                    except Exception as e:
-                        return f"❌ Erreur lors de l'initialisation: {str(e)}"
-
-                # Connect button event with 7 parameters (matching ModelArguments)
-                init_model_btn.click(
-                    fn=initialize_model_config,
-                    inputs=[
-                        vocab_size,
-                        hidden_size,
-                        num_attention_heads,
-                        num_hidden_layers,
-                        intermediate_size,
-                        hidden_dropout_prob,
-                        attention_probs_dropout_prob,
-                    ],
-                    outputs=[model_status],
-                )
-
             # Tab 3: Training Configuration and Monitoring
             with gr.Tab("3. Entraînement"):
                 with gr.Row():
                     with gr.Column():
-                        # Model training parameters
                         output_dir = gr.Textbox(
                             value="camembert-training", label="Dossier de Sortie"
                         )
@@ -233,9 +167,16 @@ class Run_Handler:
                             step=1e-6,
                             label="Learning Rate",
                         )
+                        max_steps = gr.Slider(
+                            minimum=1000,
+                            maximum=100000,
+                            value=10000,
+                            step=1000,
+                            label="Nombre Maximum de Steps",
+                            info="Défaut: 10000"
+                        )
 
                     with gr.Column():
-                        # GPU and optimization parameters
                         use_cuda = gr.Checkbox(
                             value=True,
                             label="Utiliser CUDA (si disponible)",
@@ -287,7 +228,7 @@ class Run_Handler:
                         label="Statut de l'Entraînement", interactive=False
                     )
 
-            # 4& 5  nouvel onglet de test
+            # Tab 4: Model Testing
             with gr.Tab("4. Test du Modèle"):
                 gr.Markdown("### Test de Génération de Texte")
 
@@ -324,74 +265,48 @@ class Run_Handler:
                             label="Détails des Prédictions", lines=10, interactive=False
                         )
 
-                def predict_text(text, num_tokens, top_k):
-                    try:
-                        if not self.test_predictor:
-                            if not (
-                                self.training_config and self.training_config.model
-                            ):
-                                return (
-                                    "Erreur: Modèle non initialisé",
-                                    "Veuillez d'abord configurer et entraîner le modèle",
-                                )
+            # Event Handlers
+            load_btn.click(
+                fn=self.data_loader.load_with_masking,
+                inputs=[dataset_size, masking_prob],
+                outputs=[load_status],
+            )
 
-                            self.test_predictor = TestPredictor(
-                                self.training_config.model, self.data_loader.tokenizer
-                            )
-
-                        predictions, generated_text = (
-                            self.test_predictor.predict_next_tokens(
-                                text, num_tokens=int(num_tokens), top_k=int(top_k)
-                            )
-                        )
-
-                        formatted_predictions = (
-                            self.test_predictor.format_predictions_for_display(
-                                predictions
-                            )
-                        )
-                        return generated_text, formatted_predictions
-
-                    except Exception as e:
-                        return (
-                            f"Erreur: {str(e)}",
-                            "Une erreur est survenue lors de la prédiction",
-                        )
-
-                predict_btn.click(
-                    fn=predict_text,
-                    inputs=[input_text, num_tokens, top_k],
-                    outputs=[predicted_text, predictions_display],
-                )
-
-            # Events for Tab 1
-            def visualize_with_density(text: str, density: float) -> Tuple[str, str]:
-                if text.strip():
-                    return self.data_loader.visualize_masking(text)  # Utiliser direct_masking
-                else:
-                    random_text = self.data_loader.get_random_text(min_density=float(density))
-                    return self.data_loader.visualize_masking(random_text)
-
-            # Connecter l'événement immédiatement après la définition de la fonction
             visualize_btn.click(
-                fn=visualize_with_density,
-                inputs=[masking_input, text_density],  # Utiliser masking_input au lieu de input_text
+                fn=self.data_loader.visualize_with_density,
+                inputs=[masking_input, text_density],
                 outputs=[original_text, masked_text],
             )
 
-            def load_dataset_with_masking(size, prob):
-                self.data_loader.set_mlm_probability(prob)
-                return self.data_loader.load_streaming_dataset(size)
-
-            load_btn.click(
-                fn=load_dataset_with_masking,
-                inputs=[dataset_size, masking_prob],
-                outputs=[load_status]
+            init_model_btn.click(
+                fn=lambda *args: self.model_config.initialize_full_config(
+                    *args, run_handler=self
+                ),
+                inputs=[
+                    vocab_size,
+                    hidden_size,
+                    num_attention_heads,
+                    num_hidden_layers,
+                    intermediate_size,
+                    hidden_dropout_prob,
+                    attention_probs_dropout_prob,
+                ],
+                outputs=[model_status],
             )
 
-            # Events for Tab 3
+            predict_btn.click(
+                fn=lambda *args: self.test_predictor.predict_and_display(*args)
+                if self.test_predictor
+                else "Model not initialized",
+                inputs=[input_text, num_tokens, top_k],
+                outputs=[predicted_text, predictions_display],
+            )
+
+            # Training Events
             start_training_btn.click(
-                fn=lambda *args: self.training_config.start_training(*args) if self.training_config else "❌ Configuration non initialisée",
+                fn=lambda *args: self.training_config.start_training(*args)
+                if self.training_config
+                else "❌ Configuration non initialisée",
                 inputs=[
                     output_dir,
                     num_train_epochs,
@@ -409,7 +324,30 @@ class Run_Handler:
             )
 
             stop_training_btn.click(
-                fn=lambda: self.training_config.stop_training() if self.training_config else "❌ Configuration non initialisée",
+                fn=lambda: self.training_config.stop_training()
+                if self.training_config
+                else "❌ Configuration non initialisée",
+                outputs=[training_status],
+            )
+
+            start_training_btn.click(
+                fn=lambda *args: self.training_config.start_training(*args)
+                if self.training_config
+                else "❌ Configuration non initialisée",
+                inputs=[
+                    output_dir,
+                    num_train_epochs,
+                    batch_size,
+                    learning_rate,
+                    weight_decay,
+                    warmup_steps,
+                    gradient_accumulation,
+                    wandb_project,
+                    use_cuda,
+                    fp16_training,
+                    num_workers,
+                    max_steps,  # Ajout du nouveau paramètre
+                ],
                 outputs=[training_status],
             )
 

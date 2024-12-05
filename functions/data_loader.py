@@ -1,212 +1,119 @@
 import logging
-import os
-import random
 import torch
-from typing import Dict, List, Tuple, Union, Optional
+from typing import Dict, List, Tuple
 from dataclasses import dataclass
-
 from datasets import load_dataset
 from transformers import DataCollatorForLanguageModeling, RobertaTokenizerFast
 
 @dataclass
 class MaskingResult:
-    """Structure pour les résultats de masquage"""
+    """Structure for masking results with clear metrics"""
     original_text: str
     masked_text: str
     masking_ratio: float
     num_masked_tokens: int
     total_tokens: int
 
-class DataLoaderError(Exception):
-    """Classe personnalisée pour les erreurs du DataLoader"""
-    pass
+@dataclass
+class MaskingStats:
+    """Structure for masking statistics"""
+    average_ratio: float
+    num_samples: int
+    expected_ratio: float
+    deviation: float
 
 class DataLoader:
     def __init__(self):
         self.logger = logging.getLogger(__name__)
-        self._setup_tokenizer()
+        self.tokenizer = self._initialize_tokenizer()
         self.dataset = None
         self.mlm_probability = 0.15
         self._dataset_size = 0
-        self._seed = 42
-        self._last_masking_ratio = 0.0
-        self._initialize_data_collator()
+        self.data_collator = self._initialize_data_collator()
+        self._last_masking_stats = None
 
-    def _setup_tokenizer(self) -> None:
-        """Initialise le tokenizer avec gestion des erreurs"""
+    def _initialize_tokenizer(self) -> RobertaTokenizerFast:
+        """Initialize RoBERTa tokenizer with error handling"""
         try:
-            os.environ["TOKENIZERS_PARALLELISM"] = "false"
-            self.tokenizer = RobertaTokenizerFast.from_pretrained("roberta-base")
+            return RobertaTokenizerFast.from_pretrained("roberta-base")
         except Exception as e:
-            raise DataLoaderError(f"Erreur d'initialisation du tokenizer: {e}")
+            self.logger.error(f"Failed to initialize tokenizer: {e}")
+            raise
 
-    def _initialize_data_collator(self) -> None:
-        """Initialise le data collator avec la probabilité MLM actuelle"""
+    def _initialize_data_collator(self) -> DataCollatorForLanguageModeling:
+        """Initialize MLM data collator with current probability"""
+        return DataCollatorForLanguageModeling(
+            tokenizer=self.tokenizer,
+            mlm=True,
+            mlm_probability=self.mlm_probability
+        )
+
+    def load_with_masking(self, size: float, prob: float) -> str:
+        """Legacy method for compatibility with run_handler"""
         try:
-            self.data_collator = DataCollatorForLanguageModeling(
-                tokenizer=self.tokenizer,
-                mlm=True,
-                mlm_probability=self.mlm_probability
-            )
-        except Exception as e:
-            raise DataLoaderError(f"Erreur d'initialisation du data collator: {e}")
-
-    def set_mlm_probability(self, prob: float) -> None:
-        """Met à jour la probabilité de masquage"""
-        if not 0 < prob < 1:
-            raise ValueError("La probabilité de masquage doit être entre 0 et 1")
-        if prob != self.mlm_probability:
             self.mlm_probability = prob
-            self._initialize_data_collator()
-            self.logger.info(f"Probabilité MLM mise à jour: {prob}")
-
-    def load_streaming_dataset(self, size_gb: float, seed: Optional[int] = None) -> str:
-        """Charge une portion du dataset OSCAR en streaming"""
-        try:
-            if seed is not None:
-                self._seed = seed
-            
-            self._dataset_size = self._calculate_dataset_size(size_gb)
-            self.dataset = self._setup_streaming_dataset()
-            masking_stats = self._verify_masking()
-            
-            return self._format_loading_status(size_gb, masking_stats)
-            
+            self.data_collator = self._initialize_data_collator()
+            return self.load_streaming_dataset(size)
         except Exception as e:
-            error_msg = f"Erreur lors du chargement du dataset: {e}"
+            error_msg = f"Error during loading: {e}"
             self.logger.error(error_msg)
             return error_msg
 
-    def _calculate_dataset_size(self, size_gb: float) -> int:
-        """Calcule la taille du dataset en tokens"""
-        tokens_per_gb = int((1024 * 1024 * 1024) / 4)
-        return int(size_gb * tokens_per_gb)
-
-    def _setup_streaming_dataset(self):
-        """Configure le dataset en streaming avec shuffling"""
+    def load_streaming_dataset(self, size_gb: float) -> str:
+        """Load streaming dataset with verification"""
         try:
-            base_dataset = load_dataset(
+            tokens_per_gb = int((1024 * 1024 * 1024) / 4)
+            self._dataset_size = int(size_gb * tokens_per_gb)
+            
+            self.dataset = load_dataset(
                 "oscar-corpus/OSCAR-2301",
                 "fr",
                 split="train",
-                streaming=True,
-                trust_remote_code=True
-            )
-
-            buffer_size = min(10000, self._dataset_size)
-            shuffled_dataset = base_dataset.shuffle(
-                seed=self._seed,
-                buffer_size=buffer_size
-            )
-
-            processed_dataset = shuffled_dataset.map(
-                lambda examples: self.tokenize_function(examples["text"]),
+                streaming=True
+            ).shuffle(buffer_size=10000)
+            
+            self.dataset = self.dataset.map(
+                self._process_text,
                 remove_columns=["text", "meta"],
-                batched=True,
-                batch_size=1000
-            )
-
-            return processed_dataset.take(self._dataset_size)
-        except Exception as e:
-            raise DataLoaderError(f"Erreur lors de la configuration du dataset: {e}")
-
-    def _verify_masking(self) -> Dict[str, float]:
-        """Vérifie et analyse le masquage sur un échantillon"""
-        try:
-            # Prendre plusieurs échantillons pour l'analyse
-            samples = []
-            for sample in self.dataset.take(5):
-                # Convertir les listes en tensors
-                sample = {
-                    'input_ids': torch.tensor(sample['input_ids']),
-                    'attention_mask': torch.tensor(sample['attention_mask'])
-                }
-                samples.append(sample)
-
-            stats = self._analyze_masking_samples(samples)
-            self._last_masking_ratio = stats['average_ratio']
+                batched=True
+            ).take(self._dataset_size)
             
-            self.logger.info(
-                f"Vérification masquage - Attendu: {self.mlm_probability:.2%}, "
-                f"Réel: {stats['average_ratio']:.2%}"
-            )
-            
-            return stats
+            # Verify masking
+            masking_stats = self._verify_masking()
+            return self._format_loading_status(size_gb, masking_stats)
             
         except Exception as e:
-            raise DataLoaderError(f"Erreur lors de la vérification du masking: {e}")
+            error_msg = f"Failed to load dataset: {e}"
+            self.logger.error(error_msg)
+            return f"❌ {error_msg}"
 
-    def _analyze_masking_samples(self, samples: List[Dict]) -> Dict[str, float]:
-        """Analyse les statistiques de masquage sur plusieurs échantillons"""
-        total_ratio = 0
-        valid_samples = 0
+    def _process_text(self, examples: Dict) -> Dict:
+        """Process text examples with tokenization"""
+        return self.tokenizer(
+            examples["text"],
+            truncation=True,
+            max_length=512,
+            padding="max_length",
+            return_special_tokens_mask=True
+        )
 
-        for sample in samples:
-            masked_batch = self.data_collator([sample])
-            
-            # Assurer que attention_mask est un tensor
-            if not isinstance(sample['attention_mask'], torch.Tensor):
-                attention_mask = torch.tensor(sample['attention_mask'])
-            else:
-                attention_mask = sample['attention_mask']
-                
-            stats = self._analyze_single_mask(masked_batch, attention_mask)
-            
-            if stats['valid_tokens'] > 0:
-                total_ratio += stats['mask_ratio']
-                valid_samples += 1
-
-        average_ratio = total_ratio / valid_samples if valid_samples > 0 else 0
-        return {
-            'average_ratio': average_ratio,
-            'num_samples': valid_samples
-        }
-
-    def _analyze_single_mask(self, masked_batch: Dict, attention_mask: torch.Tensor) -> Dict:
-        """Analyse les statistiques de masquage pour un seul échantillon"""
-        # S'assurer que les tenseurs sont sur le bon device
-        attention_mask = attention_mask.to(masked_batch['labels'].device)
-        
-        # Calculer les statistiques
-        valid_tokens = attention_mask.sum().item()
-        masked_tokens = (masked_batch['labels'][0] != -100).sum().item()
-        mask_ratio = masked_tokens / valid_tokens if valid_tokens > 0 else 0
-        
-        return {
-            'valid_tokens': valid_tokens,
-            'masked_tokens': masked_tokens,
-            'mask_ratio': mask_ratio
-        }
-
-    def visualize_masking(self, text: str, min_density: float = 0.6) -> Tuple[str, str]:
-        """
-        Visualise le masquage d'un texte. Si aucun texte n'est fourni, en sélectionne un aléatoirement.
-        
-        Args:
-            text (str): Texte à masquer (si vide, un texte aléatoire sera utilisé)
-            min_density (float): Pour la sélection aléatoire, densité minimale de texte requise
-            
-        Returns:
-            Tuple[str, str]: (texte original, texte masqué)
-        """
+    def visualize_with_density(self, text: str, density: float) -> Tuple[str, str]:
+        """Visualize masking with minimum density requirement"""
         try:
-            # Si pas de texte fourni, en prendre un aléatoire du dataset
-            if not text.strip():
-                if not self.dataset:
-                    return "Veuillez d'abord charger le dataset.", ""
-                    
-                # Prendre des échantillons jusqu'à trouver un texte assez dense
-                for _ in range(10):  # max 10 tentatives
-                    sample = next(iter(self.dataset.shuffle(seed=random.randint(0, 1000)).take(1)))
-                    density = sum(sample['attention_mask']) / len(sample['attention_mask'])
-                    
-                    if density >= min_density:
-                        text = self.tokenizer.decode(sample["input_ids"])
-                        break
-                else:
-                    return f"Impossible de trouver un texte avec densité >= {min_density}", ""
+            if text.strip():
+                return self.visualize_masking(text)
+            
+            random_text = self.get_random_text(min_density=float(density))
+            return self.visualize_masking(random_text)
+            
+        except Exception as e:
+            error_msg = f"Error in visualization: {e}"
+            self.logger.error(error_msg)
+            return error_msg, ""
 
-            # Appliquer le masquage
+    def visualize_masking(self, text: str) -> Tuple[str, str]:
+        """Visualize masking of input text"""
+        try:
             inputs = self.tokenizer(
                 text,
                 truncation=True,
@@ -220,79 +127,101 @@ class DataLoader:
                 "attention_mask": inputs["attention_mask"][0]
             }])
 
-            masked_text = self.tokenizer.decode(masked["input_ids"][0])
+            original_text = self.tokenizer.decode(
+                inputs["input_ids"][0],
+                skip_special_tokens=True
+            )
+
+            masked_text = self.tokenizer.decode(
+                masked["input_ids"][0],
+                skip_special_tokens=False
+            )
             
-            return text, masked_text
+            return original_text, masked_text
 
         except Exception as e:
-            self.logger.error(f"Erreur lors de la visualisation du masking: {e}")
-            return f"Erreur: {str(e)}", ""
+            self.logger.error(f"Error in masking visualization: {e}")
+            return f"Error: {str(e)}", ""
 
-    def get_random_text(self, min_density: float, max_attempts: int = 10) -> str:
-        """Récupère un texte aléatoire avec une densité minimale"""
+    def _verify_masking(self) -> MaskingStats:
+        """Verify masking on sample data"""
+        try:
+            samples = []
+            for sample in self.dataset.take(5):
+                sample = {
+                    'input_ids': torch.tensor(sample['input_ids']),
+                    'attention_mask': torch.tensor(sample['attention_mask'])
+                }
+                samples.append(sample)
+
+            stats = self._analyze_masking_samples(samples)
+            self._last_masking_stats = stats
+            
+            self.logger.info(
+                f"Masking verification - Expected: {self.mlm_probability:.2%}, "
+                f"Actual: {stats.average_ratio:.2%}"
+            )
+            
+            return stats
+            
+        except Exception as e:
+            self.logger.error(f"Error in masking verification: {e}")
+            raise
+
+    def _analyze_masking_samples(self, samples: List[Dict]) -> MaskingStats:
+        """Analyze masking statistics on multiple samples"""
+        total_ratio = 0
+        valid_samples = 0
+
+        for sample in samples:
+            masked_batch = self.data_collator([sample])
+            attention_mask = sample['attention_mask']
+            
+            if not isinstance(attention_mask, torch.Tensor):
+                attention_mask = torch.tensor(attention_mask)
+                
+            masked_tokens = (masked_batch['labels'][0] != -100).sum().item()
+            valid_tokens = attention_mask.sum().item()
+            
+            if valid_tokens > 0:
+                total_ratio += masked_tokens / valid_tokens
+                valid_samples += 1
+
+        average_ratio = total_ratio / valid_samples if valid_samples > 0 else 0
+        return MaskingStats(
+            average_ratio=average_ratio,
+            num_samples=valid_samples,
+            expected_ratio=self.mlm_probability,
+            deviation=abs(average_ratio - self.mlm_probability)
+        )
+
+    def get_random_text(self, min_density: float = 0.6) -> str:
+        """Get random text sample with minimum token density"""
         if not self.is_ready():
-            raise DataLoaderError("Dataset non chargé")
-            
-        for _ in range(max_attempts):
-            sample = next(iter(self.dataset.shuffle(seed=random.randint(0, 1000)).take(1)))
-            # Convertir en tensor pour le calcul de densité
-            sample = {k: torch.tensor(v) for k, v in sample.items()}
-            density = self._calculate_text_density(sample)
-            if density >= min_density:
-                return self.tokenizer.decode(sample["input_ids"])
+            raise ValueError("Dataset not loaded")
         
-        raise DataLoaderError(f"Impossible de trouver un texte avec densité >= {min_density}")
-
-    def _apply_masking(self, text: str) -> Dict:
-        """Applique le masquage à un texte"""
-        inputs = self.tokenizer(
-            text,
-            truncation=True,
-            max_length=512,
-            padding='max_length',
-            return_tensors="pt"
-        )
-
-        features = [{
-            "input_ids": inputs["input_ids"][0],
-            "attention_mask": inputs["attention_mask"][0],
-        }]
-
-        return self.data_collator(features)
-
-    def tokenize_function(self, texts: Union[str, List[str]]) -> Dict:
-        """Tokenize le texte avec troncature et gestion des différents formats d'entrée"""
-        if isinstance(texts, str):
-            texts = [texts]
-        elif not isinstance(texts, list):
-            raise DataLoaderError("Format de texte non supporté")
+        for _ in range(10):  # Max attempts
+            sample = next(iter(self.dataset.shuffle().take(1)))
+            attention_mask = torch.tensor(sample["attention_mask"])
+            density = attention_mask.sum().item() / len(attention_mask)
             
-        return self.tokenizer(
-            texts,
-            truncation=True,
-            max_length=512,
-            padding="max_length",
-            return_special_tokens_mask=True,
-        )
-
-    def _calculate_text_density(self, sample: Dict[str, torch.Tensor]) -> float:
-        """Calcule la densité de texte (ratio tokens réels vs padding)"""
-        attention_mask = sample['attention_mask']
-        if not isinstance(attention_mask, torch.Tensor):
-            attention_mask = torch.tensor(attention_mask)
-        return attention_mask.sum().item() / len(attention_mask)
+            if density >= min_density:
+                return self.tokenizer.decode(sample["input_ids"], skip_special_tokens=True)
+                
+        raise ValueError(f"Could not find text with density >= {min_density}")
 
     def is_ready(self) -> bool:
-        """Vérifie si le dataset est prêt"""
+        """Check if dataset is loaded and ready"""
         return self.dataset is not None and self._dataset_size > 0
 
-    def get_dataset_size(self) -> int:
-        """Retourne la taille du dataset"""
+    @property
+    def dataset_size(self) -> int:
+        """Get current dataset size in tokens"""
         return self._dataset_size
 
-    def _format_loading_status(self, size_gb: float, masking_stats: Dict[str, float]) -> str:
-        """Formate le message de statut du chargement"""
-        return (f"✅ Dataset chargé avec succès! "
-                f"Taille: {size_gb} GB, "
-                f"Masking effectif: {masking_stats['average_ratio']:.2%} "
-                f"(cible: {self.mlm_probability:.1%})")
+    def _format_loading_status(self, size_gb: float, stats: MaskingStats) -> str:
+        """Format loading status message"""
+        return (f"✅ Dataset loaded successfully! "
+                f"Size: {size_gb} GB, "
+                f"Effective masking: {stats.average_ratio:.2%} "
+                f"(target: {self.mlm_probability:.1%})")
