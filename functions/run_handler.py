@@ -1,9 +1,15 @@
 import logging
-
+import os
+import torch
 import gradio as gr
+from typing import List
+
+from transformers import RobertaForMaskedLM, RobertaTokenizerFast
+import wandb
 
 from .data_loader import DataLoader
 from .model_config import ModelConfig
+from .test_predictor import TestPredictor
 
 
 class Run_Handler:
@@ -69,11 +75,9 @@ class Run_Handler:
                             label="Texte Masqué", lines=3, interactive=False
                         )
 
-            # Tab 2: Model Configuration
             with gr.Tab("2. Configuration du Modèle"):
                 with gr.Row():
                     with gr.Column():
-                        # Architecture parametres
                         vocab_size = gr.Slider(
                             minimum=10000,
                             maximum=100000,
@@ -139,12 +143,12 @@ class Run_Handler:
                         label="Configuration du Modèle", lines=6, interactive=False
                     )
 
-            # Tab 3: Training Configuration and Monitoring
             with gr.Tab("3. Entraînement"):
                 with gr.Row():
                     with gr.Column():
                         output_dir = gr.Textbox(
-                            value="camembert-training", label="Dossier de Sortie"
+                            value="camembert-training", 
+                            label="Dossier de Sortie"
                         )
                         num_train_epochs = gr.Slider(
                             minimum=1,
@@ -218,20 +222,69 @@ class Run_Handler:
 
                 with gr.Row():
                     wandb_project = gr.Textbox(
-                        value="camembert-training", label="Nom du Projet W&B"
+                        value="camembert-training", 
+                        label="Nom du Projet W&B"
                     )
+
+                # Nouvelle section pour les checkpoints
+                gr.Markdown("### Gestion des Checkpoints")
+                with gr.Row():
+                    with gr.Column():
+                        checkpoint_folder = gr.Textbox(
+                            label="Dossier des checkpoints",
+                            value="camembert-training",
+                            interactive=True
+                        )
+                        available_checkpoints = gr.Dropdown(
+                        label="Checkpoints disponibles",
+                        choices=["weights"],  # Valeur par défaut
+                        interactive=True,
+                        allow_custom_value=False  # Empêche les valeurs personnalisées
+                    )
+                        refresh_checkpoints = gr.Button("Rafraîchir la liste")
+                        load_checkpoint_btn = gr.Button("Charger Checkpoint")
+                        checkpoint_info = gr.TextArea(
+                            label="Informations du Checkpoint",
+                            interactive=False,
+                            lines=10
+                        )
 
                 with gr.Row():
                     start_training_btn = gr.Button("Démarrer l'Entraînement")
                     stop_training_btn = gr.Button("Arrêter l'Entraînement")
                     training_status = gr.Textbox(
-                        label="Statut de l'Entraînement", interactive=False
+                        label="Statut de l'Entraînement", 
+                        interactive=False
                     )
 
-            # Tab 4: Model Testing
             with gr.Tab("4. Test du Modèle"):
-                gr.Markdown("### Test de Génération de Texte")
+                gr.Markdown("### Chargement du Modèle")
+                with gr.Row():
+                    with gr.Column():
+                        model_source = gr.Radio(
+                            choices=["Checkpoint", "Weights"],
+                            label="Source du modèle",
+                            value="Weights"
+                        )
+                        test_checkpoint_folder = gr.Textbox(
+                            label="Dossier source",
+                            value="camembert-training",
+                            interactive=True
+                        )
+                        test_checkpoints = gr.Dropdown(
+                        label="Points de restauration disponibles",
+                        choices=["weights"],  # Valeur par défaut
+                        interactive=True,
+                        allow_custom_value=False  # Empêche les valeurs personnalisées
+                    )
+                        refresh_test_checkpoints = gr.Button("Rafraîchir la liste")
+                        load_test_model = gr.Button("Charger le modèle")
+                        model_load_status = gr.Textbox(
+                            label="Statut du chargement",
+                            interactive=False
+                        )
 
+                gr.Markdown("### Test de Génération de Texte")
                 with gr.Row():
                     with gr.Column():
                         input_text = gr.Textbox(
@@ -294,15 +347,39 @@ class Run_Handler:
                 outputs=[model_status],
             )
 
+            # Event handlers pour les checkpoints
+            refresh_checkpoints.click(
+                fn=self._get_available_checkpoints,
+                inputs=[checkpoint_folder],
+                outputs=[available_checkpoints],
+            )
+            
+            refresh_test_checkpoints.click(
+                fn=self._get_available_checkpoints,
+                inputs=[test_checkpoint_folder],
+                outputs=[test_checkpoints],
+            )
+            
+            load_checkpoint_btn.click(
+                fn=self._get_checkpoint_info,
+                inputs=[checkpoint_folder, available_checkpoints],
+                outputs=[checkpoint_info]
+            )
+            
+            load_test_model.click(
+                fn=self._load_model_for_testing,
+                inputs=[model_source, test_checkpoint_folder, test_checkpoints],
+                outputs=[model_load_status]
+            )
+
             predict_btn.click(
                 fn=lambda *args: self.test_predictor.predict_and_display(*args)
                 if self.test_predictor
-                else "Model not initialized",
+                else ("Modèle non initialisé", "Veuillez d'abord charger un modèle"),
                 inputs=[input_text, num_tokens, top_k],
                 outputs=[predicted_text, predictions_display],
             )
 
-            # Training Events
             start_training_btn.click(
                 fn=lambda *args: self.training_config.start_training(*args)
                 if self.training_config
@@ -319,6 +396,7 @@ class Run_Handler:
                     use_cuda,
                     fp16_training,
                     num_workers,
+                    max_steps,
                 ],
                 outputs=[training_status],
             )
@@ -330,28 +408,113 @@ class Run_Handler:
                 outputs=[training_status],
             )
 
-            start_training_btn.click(
-                fn=lambda *args: self.training_config.start_training(*args)
-                if self.training_config
-                else "❌ Configuration non initialisée",
-                inputs=[
-                    output_dir,
-                    num_train_epochs,
-                    batch_size,
-                    learning_rate,
-                    weight_decay,
-                    warmup_steps,
-                    gradient_accumulation,
-                    wandb_project,
-                    use_cuda,
-                    fp16_training,
-                    num_workers,
-                    max_steps,  # Ajout du nouveau paramètre
-                ],
-                outputs=[training_status],
-            )
-
             return interface
+
+    def _get_available_checkpoints(self, folder: str) -> List[str]:
+        """Récupère la liste des checkpoints disponibles"""
+        try:
+            if not os.path.exists(folder):
+                self.logger.warning(f"Dossier non trouvé: {folder}")
+                return []
+                
+            checkpoints = []
+            # Ajoute le dossier weights s'il existe
+            weights_path = os.path.join(folder, "weights")
+            if os.path.exists(weights_path):
+                checkpoints.append("weights")
+                
+            # Ajoute les checkpoints
+            for item in os.listdir(folder):
+                if item.startswith("checkpoint-"):
+                    checkpoints.append(item)
+            
+            sorted_checkpoints = sorted(checkpoints, 
+                                    key=lambda x: int(x.split('-')[1]) if x != "weights" else float('inf'))
+            
+            self.logger.info(f"Checkpoints trouvés dans {folder}: {sorted_checkpoints}")
+            return sorted_checkpoints
+
+        except Exception as e:
+            self.logger.error(f"Erreur lors de la lecture des checkpoints: {e}")
+            return []
+    
+    def _get_checkpoint_info(self, folder: str, checkpoint: str) -> str:
+        """Récupère les informations d'un checkpoint"""
+        try:
+            checkpoint_path = os.path.join(folder, checkpoint)
+            
+            # Lecture du rapport de métriques
+            metrics_path = os.path.join(checkpoint_path, "metrics_report.txt")
+            if os.path.exists(metrics_path):
+                with open(metrics_path, 'r') as f:
+                    metrics = f.read()
+            else:
+                metrics = "Rapport de métriques non disponible"
+                
+            # Lecture de l'état de l'entraînement
+            trainer_state_path = os.path.join(checkpoint_path, "trainer_state.pt")
+            if os.path.exists(trainer_state_path):
+                state = torch.load(trainer_state_path)
+                training_info = (
+                    f"État de l'entraînement:\n"
+                    f"- Step: {state.get('global_step', 'N/A')}\n"
+                    f"- Epoch: {state.get('epoch', 'N/A')}\n"
+                )
+            else:
+                training_info = "État de l'entraînement non disponible"
+                
+            return f"{training_info}\n\nMétriques détaillées:\n{metrics}"
+        except Exception as e:
+            return f"Erreur lors de la lecture des informations: {str(e)}"
+        
+    def _load_model_for_testing(self, source: str, folder: str, checkpoint: str) -> str:
+        """Charge le modèle pour le test depuis un checkpoint ou les weights"""
+        try:
+            if not folder or not checkpoint:
+                return "❌ Veuillez sélectionner un dossier et un point de restauration"
+
+            # Déterminer le chemin selon la source
+            if source == "Weights":
+                path = os.path.join(folder, "weights")
+            else:
+                path = os.path.join(folder, checkpoint)
+
+            if not os.path.exists(path):
+                return f"❌ Chemin non trouvé: {path}"
+
+            # Charger le modèle et le tokenizer
+            model = RobertaForMaskedLM.from_pretrained(path)
+            tokenizer = RobertaTokenizerFast.from_pretrained(path)
+            
+            # Déplacer le modèle sur GPU si disponible
+            if torch.cuda.is_available():
+                model = model.cuda()
+            
+            # Mettre à jour le test_predictor
+            self.test_predictor = TestPredictor(model, tokenizer)
+            
+            self.logger.info(f"Modèle chargé depuis: {path}")
+            return "✅ Modèle chargé avec succès"
+            
+        except Exception as e:
+            error_msg = f"❌ Erreur lors du chargement: {str(e)}"
+            self.logger.error(error_msg)
+            return error_msg
+
+    def _load_model_and_tokenizer(self, path: str) -> None:
+        """Charge le modèle et le tokenizer depuis un checkpoint ou weights"""
+        try:
+            # Utilisation de from_pretrained pour charger le modèle
+            model = RobertaForMaskedLM.from_pretrained(path)
+            tokenizer = RobertaTokenizerFast.from_pretrained(path)
+            
+            # Mise à jour du test_predictor
+            self.test_predictor = TestPredictor(model, tokenizer)
+            
+            self.logger.info(f"Modèle chargé depuis: {path}")
+        except Exception as e:
+            self.logger.error(f"Erreur lors du chargement du modèle: {e}")
+            raise
 
     def run(self) -> None:
         """Lance l'interface Gradio"""
