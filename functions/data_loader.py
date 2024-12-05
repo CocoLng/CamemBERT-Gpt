@@ -1,9 +1,12 @@
 import logging
 import torch
+import os
 from typing import Dict, List, Tuple
 from dataclasses import dataclass
 from datasets import load_dataset
 from transformers import DataCollatorForLanguageModeling, RobertaTokenizerFast
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 @dataclass
 class MaskingResult:
@@ -25,34 +28,66 @@ class MaskingStats:
 class DataLoader:
     def __init__(self):
         self.logger = logging.getLogger(__name__)
-        self.tokenizer = self._initialize_tokenizer()
+        self.tokenizer = None
         self.dataset = None
         self.mlm_probability = 0.15
         self._dataset_size = 0
-        self.data_collator = self._initialize_data_collator()
+        self.vocab_size = None
+        self.data_collator = None
         self._last_masking_stats = None
 
-    def _initialize_tokenizer(self) -> RobertaTokenizerFast:
-        """Initialize RoBERTa tokenizer with error handling"""
+    def _initialize_tokenizer(self, vocab_size: int = 50265) -> RobertaTokenizerFast:
+        """Initialize RoBERTa tokenizer with error handling and vocab size check"""
         try:
-            return RobertaTokenizerFast.from_pretrained("roberta-base")
+            self.vocab_size = vocab_size
+            tokenizer = RobertaTokenizerFast.from_pretrained("roberta-base")
+            # Resize le vocabulaire si nécessaire
+            if vocab_size != len(tokenizer):
+                tokenizer = RobertaTokenizerFast.from_pretrained(
+                    "roberta-base",
+                    model_max_length=512,
+                    vocab_size=vocab_size
+                )
+            self.tokenizer = tokenizer
+            return tokenizer
         except Exception as e:
             self.logger.error(f"Failed to initialize tokenizer: {e}")
             raise
 
     def _initialize_data_collator(self) -> DataCollatorForLanguageModeling:
-        """Initialize MLM data collator with current probability"""
+        """Initialize MLM data collator with current probability and vocab size check"""
+        if not self.tokenizer:
+            raise ValueError("Tokenizer must be initialized before data collator")
+            
         return DataCollatorForLanguageModeling(
             tokenizer=self.tokenizer,
             mlm=True,
             mlm_probability=self.mlm_probability
         )
 
-    def load_with_masking(self, size: float, prob: float) -> str:
-        """Legacy method for compatibility with run_handler"""
+    def setup_for_training(self, vocab_size: int):
+        """Setup tokenizer and collator with specific vocab size"""
+        self._initialize_tokenizer(vocab_size)
+        self.data_collator = self._initialize_data_collator()
+
+    def _process_text(self, examples: Dict) -> Dict:
+        
+        return self.tokenizer(
+            examples["text"],
+            truncation=True,
+            max_length=512,
+            padding="max_length",
+            return_special_tokens_mask=True
+        )
+
+    def load_with_masking(self, size: float, prob: float, vocab_size: int = None) -> str:
+        """Legacy method with vocab size handling"""
         try:
             self.mlm_probability = prob
-            self.data_collator = self._initialize_data_collator()
+            if vocab_size:
+                self.setup_for_training(vocab_size)
+            elif not self.tokenizer:
+                self.setup_for_training(50265)  # Default vocab size
             return self.load_streaming_dataset(size)
         except Exception as e:
             error_msg = f"Error during loading: {e}"
@@ -62,40 +97,40 @@ class DataLoader:
     def load_streaming_dataset(self, size_gb: float) -> str:
         """Load streaming dataset with verification"""
         try:
+            # Set environment variable to handle fork warnings
+            os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
             tokens_per_gb = int((1024 * 1024 * 1024) / 4)
             self._dataset_size = int(size_gb * tokens_per_gb)
             
+            # Load dataset with proper buffering
             self.dataset = load_dataset(
                 "oscar-corpus/OSCAR-2301",
                 "fr",
                 split="train",
                 streaming=True
-            ).shuffle(buffer_size=10000)
+            ).shuffle(
+                buffer_size=10000,
+                seed=42  # Fixed seed for reproducibility
+            )
             
+            # Use batched mapping without num_proc for streaming dataset
             self.dataset = self.dataset.map(
                 self._process_text,
                 remove_columns=["text", "meta"],
-                batched=True
+                batched=True,
+                batch_size=100  # Controlled batch size
             ).take(self._dataset_size)
             
             # Verify masking
             masking_stats = self._verify_masking()
             return self._format_loading_status(size_gb, masking_stats)
-            
+                
         except Exception as e:
             error_msg = f"Failed to load dataset: {e}"
             self.logger.error(error_msg)
             return f"❌ {error_msg}"
 
-    def _process_text(self, examples: Dict) -> Dict:
-        """Process text examples with tokenization"""
-        return self.tokenizer(
-            examples["text"],
-            truncation=True,
-            max_length=512,
-            padding="max_length",
-            return_special_tokens_mask=True
-        )
 
     def visualize_with_density(self, text: str, density: float) -> Tuple[str, str]:
         """Visualize masking with minimum density requirement"""

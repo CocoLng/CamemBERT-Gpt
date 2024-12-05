@@ -264,7 +264,7 @@ class TrainingConfig:
                 expected_mlm_probability=self.data_loader.mlm_probability
             )
 
-            # Create trainer
+            # Setup trainer with safe defaults
             self.trainer = CustomTrainer(
                 data_loader=self.data_loader,
                 model=self.model,
@@ -274,14 +274,14 @@ class TrainingConfig:
                 callbacks=[masking_monitor]
             )
 
-            # Verify setup
+            # Verify setup with the monitor
             self._verify_training_setup(masking_monitor)
-            
+                
         except Exception as e:
             self.logger.error(f"Error setting up trainer: {e}")
             raise
 
-    def _verify_training_setup(self, masking_monitor):
+    def _verify_training_setup(self, masking_monitor: MaskingMonitorCallback):
         """Verify training setup and masking configuration"""
         try:
             # Test batch processing
@@ -293,7 +293,7 @@ class TrainingConfig:
             if not all(k in test_batch for k in required_keys):
                 raise ValueError(f"Invalid batch structure. Missing: {required_keys - set(test_batch.keys())}")
 
-            # Verify masking
+            # Verify masking using the monitor
             stats = masking_monitor.analyze_batch(test_batch)
             self.logger.info(
                 f"Setup verification:\n"
@@ -304,6 +304,25 @@ class TrainingConfig:
         except Exception as e:
             self.logger.error(f"Setup verification failed: {e}")
             raise
+
+    def _verify_masking_stats(self, stats) -> bool:
+        """Verify masking statistics are within acceptable range"""
+        if not stats:
+            return False
+            
+        tolerance = 0.02  # 2% tolerance
+        expected = self.data_loader.mlm_probability
+        actual = stats['current_masking_ratio']
+        
+        within_tolerance = abs(actual - expected) <= tolerance
+        
+        if not within_tolerance:
+            self.logger.warning(
+                f"Masking ratio {actual:.2%} outside tolerance range "
+                f"[{expected-tolerance:.2%}, {expected+tolerance:.2%}]"
+            )
+            
+        return within_tolerance
 
     def start_training(self, output_dir: str, num_train_epochs: int, batch_size: int,
                   learning_rate: float, weight_decay: float, warmup_steps: int,

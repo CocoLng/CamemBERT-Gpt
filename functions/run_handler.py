@@ -320,8 +320,8 @@ class Run_Handler:
 
             # Event Handlers
             load_btn.click(
-                fn=self.data_loader.load_with_masking,
-                inputs=[dataset_size, masking_prob],
+                fn=self._load_dataset_with_vocab_check,
+                inputs=[dataset_size, masking_prob, vocab_size], 
                 outputs=[load_status],
             )
 
@@ -332,9 +332,7 @@ class Run_Handler:
             )
 
             init_model_btn.click(
-                fn=lambda *args: self.model_config.initialize_full_config(
-                    *args, run_handler=self
-                ),
+                fn=self._initialize_model_with_vocab,
                 inputs=[
                     vocab_size,
                     hidden_size,
@@ -515,6 +513,84 @@ class Run_Handler:
         except Exception as e:
             self.logger.error(f"Erreur lors du chargement du modèle: {e}")
             raise
+
+    # Pour fixer les erreurs CUDA
+    def _load_dataset_with_vocab_check(self, size: float, prob: float, vocab_size: int) -> str:
+        """Load dataset with vocabulary size synchronization"""
+        try:
+            # Update current vocab size
+            self._current_vocab_size = vocab_size
+            
+            # Initialize data loader with correct vocab size
+            status = self.data_loader.load_with_masking(
+                size=size,
+                prob=prob,
+                vocab_size=vocab_size
+            )
+            
+            self.logger.info(f"Dataset loaded with vocab size: {vocab_size}")
+            return status
+            
+        except Exception as e:
+            error_msg = f"Error loading dataset: {e}"
+            self.logger.error(error_msg)
+            return f"❌ {error_msg}"
+
+    def _initialize_model_with_vocab(
+        self,
+        vocab_size: int,
+        hidden_size: int,
+        num_attention_heads: int,
+        num_hidden_layers: int,
+        intermediate_size: int,
+        hidden_dropout_prob: float,
+        attention_probs_dropout_prob: float,
+    ) -> str:
+        """Initialize model with vocabulary synchronization"""
+        try:
+            # Check if vocab size changed
+            if vocab_size != self._current_vocab_size:
+                # Reload dataset with new vocab size if needed
+                if self.data_loader.is_ready():
+                    self.logger.info("Reloading dataset with new vocab size")
+                    self.data_loader.setup_for_training(vocab_size)
+                self._current_vocab_size = vocab_size
+
+            return self.model_config.initialize_full_config(
+                vocab_size,
+                hidden_size,
+                num_attention_heads,
+                num_hidden_layers,
+                intermediate_size,
+                hidden_dropout_prob,
+                attention_probs_dropout_prob,
+                run_handler=self
+            )
+
+        except Exception as e:
+            error_msg = f"Error initializing model: {e}"
+            self.logger.error(error_msg)
+            return f"❌ {error_msg}"
+
+    def _verify_vocab_consistency(self) -> bool:
+        """Verify that vocabulary sizes are consistent across components"""
+        if not self.data_loader.is_ready() or not self.model_config.config:
+            return False
+
+        vocab_matches = (
+            self.data_loader.vocab_size == self.model_config.config.vocab_size == 
+            self._current_vocab_size
+        )
+        
+        if not vocab_matches:
+            self.logger.error(
+                f"Vocabulary size mismatch: "
+                f"DataLoader={self.data_loader.vocab_size}, "
+                f"Model={self.model_config.config.vocab_size}, "
+                f"Current={self._current_vocab_size}"
+            )
+            
+        return vocab_matches
 
     def run(self) -> None:
         """Lance l'interface Gradio"""
