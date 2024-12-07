@@ -12,7 +12,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 @dataclass
 class DatasetConfig:
     """Configuration for dataset loading"""
-    name: str = "oscar"  # Changed default to standard OSCAR
+    name: str = "oscar" 
     subset: Optional[str] = "unshuffled_deduplicated_fr"  # Default French subset
     split: str = "train"
     streaming: bool = True
@@ -95,99 +95,76 @@ class DataLoader:
             return example
 
     def _prepare_dataset(self, dataset: Dataset) -> Dataset:
-        """Prepare dataset with token fusion and removal"""
+        """Prepare dataset with proper text extraction"""
         try:
-            # 1. Fuse tokens if specified
-            if self.tokens_to_fuse:
-                dataset = dataset.map(
-                    self._fuse_tokens,
-                    desc="Fusing tokens"
-                )
+            def extract_text(example):
+                # Pour mOSCAR
+                if 'text' in example and isinstance(example['text'], list):
+                    texts = [item['text'] for item in example['text']]
+                    return {'text': ' '.join(texts)}
+                # Pour OSCAR
+                elif 'content' in example:
+                    return {'text': example['content']}
+                # Cas où text est déjà au bon format
+                elif 'text' in example and isinstance(example['text'], str):
+                    return {'text': example['text']}
+                else:
+                    return {'text': ''}
 
-            # 2. Remove unwanted columns
-            columns_to_remove = set(self.tokens_to_remove) & set(dataset.column_names)
-            if columns_to_remove:
-                dataset = dataset.remove_columns(list(columns_to_remove))
+            # Appliquer la transformation et ne garder que la colonne text
+            dataset = dataset.map(extract_text)
+            return dataset.select_columns(['text'])
 
-            # 3. Keep essential columns
-            essential_columns = {'text', 'label'} & set(dataset.column_names)
-            columns_to_keep = list(essential_columns)
-            dataset = dataset.select_columns(columns_to_keep)
-
-            return dataset
-            
         except Exception as e:
             self.logger.error(f"Error preparing dataset: {e}")
             raise
 
     def _tokenize_function(self, examples: Dict) -> Dict:
         """Tokenize text using HuggingFace's batch tokenization"""
-        return self.tokenizer(
-            examples['text'],
-            truncation=True,
-            max_length=512,
-            padding="max_length",
-            return_special_tokens_mask=True
-        )
+        try:
+            # S'assurer que nous avons du texte valide
+            if not isinstance(examples['text'], (str, list)):
+                raise ValueError(f"Invalid text format: {type(examples['text'])}")
+                
+            return self.tokenizer(
+                examples['text'],
+                truncation=True,
+                max_length=512,
+                padding="max_length",
+                return_special_tokens_mask=True
+            )
+        except Exception as e:
+            self.logger.error(f"Tokenization error: {e}")
+            raise
 
     def load_streaming_dataset(self, size_gb: float) -> str:
-        """Load and process streaming dataset using HuggingFace's native features"""
+        """Load and process streaming dataset"""
         try:
-            # Calculate dataset size
             tokens_per_gb = int((1024 * 1024 * 1024) / 4)
             self._dataset_size = int(size_gb * tokens_per_gb)
+
+            base_dataset = load_dataset(
+                self.dataset_config.name,
+                name=self.dataset_config.subset,
+                split=self.dataset_config.split,
+                streaming=True
+            )
             
-            # Configuration for remote loading
-            load_args = {
-                "split": self.dataset_config.split,
-                "streaming": self.dataset_config.streaming,
-                "trust_remote_code": True,  # Important pour l'accès distant
-                "use_auth_token": None  # À utiliser si le dataset nécessite une authentification
-            }
-            
-            # Add subset/language configuration if needed
-            if self.dataset_config.subset:
-                load_args["name"] = self.dataset_config.subset
-                
-            # Load dataset with proper remote configuration
-            try:
-                base_dataset = load_dataset(
-                    path=self.dataset_config.name,
-                    cache_dir=None,  # Permettre la mise en cache par défaut de HF
-                    verification_mode="no_checks",  # Éviter les vérifications locales
-                    **load_args
-                )
-                
-            except Exception as e:
-                self.logger.error(f"Error during remote dataset loading: {e}")
-                # Fallback to alternative dataset if mOSCAR fails
-                if self.dataset_config.name == "oscar-corpus/mOSCAR":
-                    self.logger.info("Falling back to OSCAR-2201...")
-                    base_dataset = load_dataset(
-                        path="oscar",
-                        name="unshuffled_deduplicated_fr",
-                        streaming=True,
-                        split="train",
-                        trust_remote_code=True
-                    )
-                else:
-                    raise e
-            
-            # Apply preprocessing pipeline
+            if base_dataset is None:
+                raise ValueError(f"Failed to load dataset {self.dataset_config.name}")
+
             self.dataset = base_dataset.shuffle(buffer_size=self.dataset_config.buffer_size)
             self.dataset = self._prepare_dataset(self.dataset)
             
-            # Apply tokenization
             self.dataset = self.dataset.map(
                 self._tokenize_function,
                 batched=True,
-                remove_columns=self.dataset.column_names
+                remove_columns=['text']
             ).take(self._dataset_size)
             
-            # Verify masking
             masking_stats = self._verify_masking()
             return self._format_loading_status(size_gb, masking_stats)
-            
+
         except Exception as e:
             error_msg = f"Failed to load dataset: {str(e)}"
             self.logger.error(error_msg)

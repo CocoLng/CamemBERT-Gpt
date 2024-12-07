@@ -48,11 +48,6 @@ class Run_Handler:
                         label="Source des Données"
                     )
                     
-                    dataset_subset = gr.Dropdown(
-                        choices=["fr", "en", "de", "es", "it"],
-                        value="fr",
-                        label="Langue"
-                    )
                     
                 with gr.Row():
                     dataset_size = gr.Slider(
@@ -116,7 +111,6 @@ class Run_Handler:
 
                 def initialize_and_load_dataset(
                     choice: str,
-                    subset: str,
                     size: float,
                     prob: float
                 ) -> str:
@@ -124,14 +118,17 @@ class Run_Handler:
                         dataset_name = dataset_mapping.get(choice)
                         if not dataset_name:
                             return "❌ Dataset non valide"
-                            
-                        # Initialize data loader with selected dataset
-                        self.data_loader = self._initialize_data_loader(
-                            dataset_name,
-                            subset
+                        
+                        # Utiliser le bon code langue selon le dataset
+                        subset = "fra_Latn" if choice == "mOSCAR (default)" else "fr"
+                        
+                        self.data_loader = DataLoader(
+                            dataset_config=DatasetConfig(
+                                name=dataset_name,
+                                subset=subset
+                            )
                         )
                         
-                        # Load the dataset
                         return self.data_loader.load_with_masking(size, prob)
                         
                     except Exception as e:
@@ -385,7 +382,7 @@ class Run_Handler:
             # Event Handlers
             load_btn.click(
                     fn=initialize_and_load_dataset,
-                    inputs=[dataset_choice, dataset_subset, dataset_size, masking_prob],
+                    inputs=[dataset_choice, dataset_size, masking_prob],
                     outputs=[load_status],
                 )
 
