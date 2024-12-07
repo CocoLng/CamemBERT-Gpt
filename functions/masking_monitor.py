@@ -11,7 +11,7 @@ class MaskingMonitorCallback(TrainerCallback):
         self.logger = logging.getLogger(__name__)
         self.mask_token_id = tokenizer.mask_token_id
         self.expected_ratio = expected_mlm_probability
-        self.check_frequency = 500  # Reduced frequency for better performance
+        self.check_frequency = 500  
         
         # Essential statistics
         self.total_masks = 0
