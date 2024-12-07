@@ -2,9 +2,13 @@
 __pycache__/
 *.py[cod]
 *$py.class
+checkpoints/
+wandb/
+camembert-training/
 
 # C extensions
 *.so
+.DS_Store
 
 # Distribution / packaging
 .Python
