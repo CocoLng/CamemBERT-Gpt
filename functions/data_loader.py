@@ -1,9 +1,24 @@
 import logging
 import torch
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 from datasets import load_dataset
 from transformers import DataCollatorForLanguageModeling, RobertaTokenizerFast
+from datasets import Dataset
+import os
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+@dataclass
+class DatasetConfig:
+    """Configuration for dataset loading"""
+    name: str = "oscar"  # Changed default to standard OSCAR
+    subset: Optional[str] = "unshuffled_deduplicated_fr"  # Default French subset
+    split: str = "train"
+    streaming: bool = True
+    buffer_size: int = 10000
+    trust_remote_code: bool = True
+    verification_mode: str = "no_checks"
 
 @dataclass
 class MaskingResult:
@@ -23,7 +38,12 @@ class MaskingStats:
     deviation: float
 
 class DataLoader:
-    def __init__(self):
+    def __init__(
+        self,
+        dataset_config: Optional[DatasetConfig] = None,
+        tokens_to_fuse: Optional[List[str]] = None,
+        tokens_to_remove: Optional[List[str]] = None
+    ):
         self.logger = logging.getLogger(__name__)
         self.tokenizer = self._initialize_tokenizer()
         self.dataset = None
@@ -31,6 +51,14 @@ class DataLoader:
         self._dataset_size = 0
         self.data_collator = self._initialize_data_collator()
         self._last_masking_stats = None
+        
+        # Dataset configuration
+        self.dataset_config = dataset_config or DatasetConfig()
+        
+        # Token processing configuration
+        self.tokens_to_fuse = tokens_to_fuse or []
+        self.tokens_to_remove = tokens_to_remove or []
+        
 
     def _initialize_tokenizer(self) -> RobertaTokenizerFast:
         """Initialize RoBERTa tokenizer with error handling"""
@@ -48,6 +76,123 @@ class DataLoader:
             mlm_probability=self.mlm_probability
         )
 
+    def _fuse_tokens(self, example: Dict) -> Dict:
+        """Fuse specified tokens into text using HuggingFace's features"""
+        if not self.tokens_to_fuse:
+            return example
+            
+        try:
+            # Create fused text from specified tokens
+            fused_parts = [str(example.get(token, "")) for token in self.tokens_to_fuse]
+            fused_text = " ".join(filter(None, fused_parts))
+            
+            # Update example with fused text
+            example['text'] = fused_text if fused_text.strip() else example.get('text', '')
+            return example
+            
+        except Exception as e:
+            self.logger.error(f"Error fusing tokens: {e}")
+            return example
+
+    def _prepare_dataset(self, dataset: Dataset) -> Dataset:
+        """Prepare dataset with token fusion and removal"""
+        try:
+            # 1. Fuse tokens if specified
+            if self.tokens_to_fuse:
+                dataset = dataset.map(
+                    self._fuse_tokens,
+                    desc="Fusing tokens"
+                )
+
+            # 2. Remove unwanted columns
+            columns_to_remove = set(self.tokens_to_remove) & set(dataset.column_names)
+            if columns_to_remove:
+                dataset = dataset.remove_columns(list(columns_to_remove))
+
+            # 3. Keep essential columns
+            essential_columns = {'text', 'label'} & set(dataset.column_names)
+            columns_to_keep = list(essential_columns)
+            dataset = dataset.select_columns(columns_to_keep)
+
+            return dataset
+            
+        except Exception as e:
+            self.logger.error(f"Error preparing dataset: {e}")
+            raise
+
+    def _tokenize_function(self, examples: Dict) -> Dict:
+        """Tokenize text using HuggingFace's batch tokenization"""
+        return self.tokenizer(
+            examples['text'],
+            truncation=True,
+            max_length=512,
+            padding="max_length",
+            return_special_tokens_mask=True
+        )
+
+    def load_streaming_dataset(self, size_gb: float) -> str:
+        """Load and process streaming dataset using HuggingFace's native features"""
+        try:
+            # Calculate dataset size
+            tokens_per_gb = int((1024 * 1024 * 1024) / 4)
+            self._dataset_size = int(size_gb * tokens_per_gb)
+            
+            # Configuration for remote loading
+            load_args = {
+                "split": self.dataset_config.split,
+                "streaming": self.dataset_config.streaming,
+                "trust_remote_code": True,  # Important pour l'accès distant
+                "use_auth_token": None  # À utiliser si le dataset nécessite une authentification
+            }
+            
+            # Add subset/language configuration if needed
+            if self.dataset_config.subset:
+                load_args["name"] = self.dataset_config.subset
+                
+            # Load dataset with proper remote configuration
+            try:
+                base_dataset = load_dataset(
+                    path=self.dataset_config.name,
+                    cache_dir=None,  # Permettre la mise en cache par défaut de HF
+                    verification_mode="no_checks",  # Éviter les vérifications locales
+                    **load_args
+                )
+                
+            except Exception as e:
+                self.logger.error(f"Error during remote dataset loading: {e}")
+                # Fallback to alternative dataset if mOSCAR fails
+                if self.dataset_config.name == "oscar-corpus/mOSCAR":
+                    self.logger.info("Falling back to OSCAR-2201...")
+                    base_dataset = load_dataset(
+                        path="oscar",
+                        name="unshuffled_deduplicated_fr",
+                        streaming=True,
+                        split="train",
+                        trust_remote_code=True
+                    )
+                else:
+                    raise e
+            
+            # Apply preprocessing pipeline
+            self.dataset = base_dataset.shuffle(buffer_size=self.dataset_config.buffer_size)
+            self.dataset = self._prepare_dataset(self.dataset)
+            
+            # Apply tokenization
+            self.dataset = self.dataset.map(
+                self._tokenize_function,
+                batched=True,
+                remove_columns=self.dataset.column_names
+            ).take(self._dataset_size)
+            
+            # Verify masking
+            masking_stats = self._verify_masking()
+            return self._format_loading_status(size_gb, masking_stats)
+            
+        except Exception as e:
+            error_msg = f"Failed to load dataset: {str(e)}"
+            self.logger.error(error_msg)
+            return f"❌ {error_msg}"
+
     def load_with_masking(self, size: float, prob: float) -> str:
         """Legacy method for compatibility with run_handler"""
         try:
@@ -59,61 +204,35 @@ class DataLoader:
             self.logger.error(error_msg)
             return error_msg
 
-    def load_streaming_dataset(self, size_gb: float) -> str:
-        """Load streaming dataset with verification"""
-        try:
-            tokens_per_gb = int((1024 * 1024 * 1024) / 4)
-            self._dataset_size = int(size_gb * tokens_per_gb)
-            
-            self.dataset = load_dataset(
-                "oscar-corpus/OSCAR-2301",
-                "fr",
-                split="train",
-                streaming=True
-            ).shuffle(buffer_size=10000)
-            
-            self.dataset = self.dataset.map(
-                self._process_text,
-                remove_columns=["text", "meta"],
-                batched=True
-            ).take(self._dataset_size)
-            
-            # Verify masking
-            masking_stats = self._verify_masking()
-            return self._format_loading_status(size_gb, masking_stats)
-            
-        except Exception as e:
-            error_msg = f"Failed to load dataset: {e}"
-            self.logger.error(error_msg)
-            return f"❌ {error_msg}"
-
-    def _process_text(self, examples: Dict) -> Dict:
-        """Process text examples with tokenization"""
-        return self.tokenizer(
-            examples["text"],
-            truncation=True,
-            max_length=512,
-            padding="max_length",
-            return_special_tokens_mask=True
-        )
-
-    def visualize_with_density(self, text: str, density: float) -> Tuple[str, str]:
+    def visualize_with_density(self, text: str, density: float) -> tuple[str, str]:
         """Visualize masking with minimum density requirement"""
         try:
+            # Si un texte est fourni, on l'utilise directement
             if text.strip():
                 return self.visualize_masking(text)
             
-            random_text = self.get_random_text(min_density=float(density))
-            return self.visualize_masking(random_text)
+            # Sinon, on vérifie si le dataset est prêt
+            if not self.is_ready():
+                return ("❌ Veuillez d'abord charger un dataset avant d'utiliser le texte aléatoire", "")
+            
+            # On essaie d'obtenir un texte aléatoire
+            try:
+                random_text = self.get_random_text(min_density=float(density))
+                return self.visualize_masking(random_text)
+            except ValueError as e:
+                return (f"❌ Erreur lors de la sélection du texte aléatoire: {str(e)}", "")
             
         except Exception as e:
-            error_msg = f"Error in visualization: {e}"
+            error_msg = f"❌ Erreur lors de la visualisation: {str(e)}"
             self.logger.error(error_msg)
             return error_msg, ""
 
-    def visualize_masking(self, text: str) -> Tuple[str, str]:
+    def visualize_masking(self, text: str) -> tuple[str, str]:
         """Visualize masking of input text"""
         try:
+            if not text or not text.strip():
+                return "❌ Texte vide", ""
+                
             inputs = self.tokenizer(
                 text,
                 truncation=True,
@@ -138,10 +257,10 @@ class DataLoader:
             )
             
             return original_text, masked_text
-
         except Exception as e:
-            self.logger.error(f"Error in masking visualization: {e}")
-            return f"Error: {str(e)}", ""
+            error_msg = f"❌ Erreur lors du masquage: {str(e)}"
+            self.logger.error(error_msg)
+            return error_msg, ""
 
     def _verify_masking(self) -> MaskingStats:
         """Verify masking on sample data"""
@@ -198,21 +317,44 @@ class DataLoader:
     def get_random_text(self, min_density: float = 0.6) -> str:
         """Get random text sample with minimum token density"""
         if not self.is_ready():
-            raise ValueError("Dataset not loaded")
+            raise ValueError("Dataset non chargé. Veuillez d'abord charger un dataset.")
         
-        for _ in range(10):  # Max attempts
-            sample = next(iter(self.dataset.shuffle().take(1)))
-            attention_mask = torch.tensor(sample["attention_mask"])
-            density = attention_mask.sum().item() / len(attention_mask)
-            
-            if density >= min_density:
-                return self.tokenizer.decode(sample["input_ids"], skip_special_tokens=True)
+        max_attempts = 20
+        for attempt in range(max_attempts):
+            try:
+                # Prendre un échantillon aléatoire
+                sample = next(iter(self.dataset.shuffle().take(1)))
+                attention_mask = torch.tensor(sample["attention_mask"])
+                density = attention_mask.sum().item() / len(attention_mask)
                 
-        raise ValueError(f"Could not find text with density >= {min_density}")
+                if density >= min_density:
+                    return self.tokenizer.decode(sample["input_ids"], skip_special_tokens=True)
+                
+                if attempt == max_attempts - 1:
+                    self.logger.warning(
+                        f"Impossible de trouver un texte avec une densité >= {min_density} "
+                        f"après {max_attempts} tentatives"
+                    )
+                    
+            except Exception as e:
+                self.logger.error(f"Erreur lors de la sélection du texte: {e}")
+                raise ValueError("Erreur lors de l'accès au dataset")
+                
+        raise ValueError(
+            f"Impossible de trouver un texte avec une densité >= {min_density}. "
+            f"Essayez de réduire la densité minimale requise."
+        )
 
     def is_ready(self) -> bool:
         """Check if dataset is loaded and ready"""
-        return self.dataset is not None and self._dataset_size > 0
+        ready = (self.dataset is not None and 
+                self._dataset_size > 0 and 
+                next(iter(self.dataset.take(1)), None) is not None)
+        
+        if not ready:
+            self.logger.warning("Dataset non chargé ou vide")
+            
+        return ready
 
     @property
     def dataset_size(self) -> int:

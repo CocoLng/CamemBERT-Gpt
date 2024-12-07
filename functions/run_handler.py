@@ -7,7 +7,7 @@ from typing import List
 from transformers import RobertaForMaskedLM, RobertaTokenizerFast
 import wandb
 
-from .data_loader import DataLoader
+from .data_loader import DataLoader, DatasetConfig
 from .model_config import ModelConfig
 from .test_predictor import TestPredictor
 
@@ -15,18 +15,45 @@ from .test_predictor import TestPredictor
 class Run_Handler:
     def __init__(self):
         self.logger = logging.getLogger(__name__)
-        self.data_loader = DataLoader()
+        # Initialize with default configuration
+        self.data_loader = DataLoader(dataset_config=DatasetConfig())  # Initialize with default mOSCAR
         self.model_config = ModelConfig()
         self.training_config = None
         self.test_predictor = None
         self.base_dir = "camembert-training"
 
+    def _initialize_data_loader(self, dataset_name: str, subset: str) -> DataLoader:
+        """Initialize data loader with specified dataset configuration"""
+        dataset_config = DatasetConfig(
+            name=dataset_name,
+            subset=subset,
+            split="train",
+            streaming=True
+        )
+        return DataLoader(dataset_config=dataset_config)
+
     def create_interface(self) -> gr.Blocks:
-        """Crée l'interface Gradio complète"""
+        """Create the Gradio interface"""
         with gr.Blocks(title="CamemBERT Training Interface") as interface:
             gr.Markdown("# 🧀 CamemBERT Training Interface")
 
             with gr.Tab("1. Chargement & Visualisation des Données"):
+                with gr.Row():
+                    dataset_choice = gr.Dropdown(
+                        choices=[
+                            "mOSCAR (default)",
+                            "OSCAR-2301"
+                        ],
+                        value="mOSCAR (default)",
+                        label="Source des Données"
+                    )
+                    
+                    dataset_subset = gr.Dropdown(
+                        choices=["fr", "en", "de", "es", "it"],
+                        value="fr",
+                        label="Langue"
+                    )
+                    
                 with gr.Row():
                     dataset_size = gr.Slider(
                         minimum=1,
@@ -42,11 +69,12 @@ class Run_Handler:
                         step=0.01,
                         label="Probabilité de Masquage (MLM)",
                     )
-                    load_btn = gr.Button("Charger Dataset")
-
+                    
                 with gr.Row():
+                    load_btn = gr.Button("Charger Dataset")
                     load_status = gr.Textbox(
-                        label="Statut du chargement", interactive=False
+                        label="Statut du chargement", 
+                        interactive=False
                     )
 
                 gr.Markdown("### Test de Masquage")
@@ -69,19 +97,53 @@ class Run_Handler:
                 with gr.Row():
                     with gr.Column():
                         original_text = gr.Textbox(
-                            label="Texte Original", lines=3, interactive=False
+                            label="Texte Original", 
+                            lines=3, 
+                            interactive=False
                         )
                     with gr.Column():
                         masked_text = gr.Textbox(
-                            label="Texte Masqué", lines=3, interactive=False
+                            label="Texte Masqué", 
+                            lines=3, 
+                            interactive=False
                         )
 
+                # Map dataset choice to actual dataset names
+                dataset_mapping = {
+                    "mOSCAR (default)": "oscar-corpus/mOSCAR",
+                    "OSCAR-2301": "oscar-corpus/OSCAR-2301"
+                }
+
+                def initialize_and_load_dataset(
+                    choice: str,
+                    subset: str,
+                    size: float,
+                    prob: float
+                ) -> str:
+                    try:
+                        dataset_name = dataset_mapping.get(choice)
+                        if not dataset_name:
+                            return "❌ Dataset non valide"
+                            
+                        # Initialize data loader with selected dataset
+                        self.data_loader = self._initialize_data_loader(
+                            dataset_name,
+                            subset
+                        )
+                        
+                        # Load the dataset
+                        return self.data_loader.load_with_masking(size, prob)
+                        
+                    except Exception as e:
+                        return f"❌ Erreur: {str(e)}"
+
+                
             with gr.Tab("2. Configuration du Modèle"):
                 with gr.Row():
                     with gr.Column():
                         vocab_size = gr.Slider(
-                            minimum=10000,
-                            maximum=100000,
+                            minimum=50265,
+                            maximum=100630,
                             value=50265,
                             step=1000,
                             label="Taille du Vocabulaire (vocab_size)",
@@ -322,16 +384,16 @@ class Run_Handler:
 
             # Event Handlers
             load_btn.click(
-                fn=self.data_loader.load_with_masking,
-                inputs=[dataset_size, masking_prob],
-                outputs=[load_status],
-            )
+                    fn=initialize_and_load_dataset,
+                    inputs=[dataset_choice, dataset_subset, dataset_size, masking_prob],
+                    outputs=[load_status],
+                )
 
             visualize_btn.click(
-                fn=self.data_loader.visualize_with_density,
-                inputs=[masking_input, text_density],
-                outputs=[original_text, masked_text],
-            )
+                    fn=self.data_loader.visualize_with_density,
+                    inputs=[masking_input, text_density],
+                    outputs=[original_text, masked_text],
+                )
 
             init_model_btn.click(
                 fn=lambda *args: self.model_config.initialize_full_config(
