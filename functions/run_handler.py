@@ -10,6 +10,7 @@ import wandb
 from .data_loader import DataLoader, DatasetConfig
 from .model_config import ModelConfig
 from .test_predictor import TestPredictor
+from .fine_tuning import FineTuning
 
 
 class Run_Handler:
@@ -20,7 +21,9 @@ class Run_Handler:
         self.model_config = ModelConfig()
         self.training_config = None
         self.test_predictor = None
+        self.fine_tuning = FineTuning()
         self.base_dir = "camembert-training"
+        
 
     def _initialize_data_loader(self, dataset_name: str, subset: str) -> DataLoader:
         """Initialize data loader with specified dataset configuration"""
@@ -379,6 +382,99 @@ class Run_Handler:
                             label="Détails des Prédictions", lines=10, interactive=False
                         )
 
+            with gr.Tab("5. Fine-Tuning"):
+                gr.Markdown("### Chargement du Modèle Pré-entraîné")
+                with gr.Row():
+                    with gr.Column():
+                        ft_model_source = gr.Radio(
+                            choices=["Checkpoint Local", "Modèle HuggingFace"],
+                            label="Source du modèle",
+                            value="Checkpoint Local"
+                        )
+                        ft_available_runs = gr.Dropdown(
+                            label="Runs disponibles",
+                            choices=self._get_run_directories(),
+                            interactive=True,
+                            visible=True
+                        )
+                        ft_checkpoints = gr.Dropdown(
+                            label="Checkpoints disponibles",
+                            choices=[],
+                            interactive=True,
+                            visible=True
+                        )
+                        ft_hf_model = gr.Textbox(
+                            label="Nom du modèle HuggingFace",
+                            placeholder="ex: camembert-base",
+                            visible=False
+                        )
+                        refresh_ft_runs = gr.Button("Rafraîchir les runs")
+                        load_ft_model = gr.Button("Charger le modèle")
+                        ft_model_status = gr.Textbox(
+                            label="Statut du chargement",
+                            interactive=False
+                        )
+
+                gr.Markdown("### Configuration du Fine-tuning")
+                with gr.Row():
+                    with gr.Column():
+                        ft_dataset = gr.Dropdown(
+                            choices=list(FineTuning.AVAILABLE_DATASETS.keys()),
+                            label="Dataset",
+                            value="multi_nli"
+                        )
+                        prepare_dataset = gr.Button("Préparer le Dataset")
+                        dataset_status = gr.Textbox(
+                            label="Statut de la préparation",
+                            interactive=False
+                        )
+
+                    with gr.Column():
+                        ft_learning_rate = gr.Slider(
+                            minimum=1e-5,
+                            maximum=1e-4,
+                            value=2e-5,
+                            step=1e-5,
+                            label="Learning Rate"
+                        )
+                        ft_epochs = gr.Slider(
+                            minimum=1,
+                            maximum=10,
+                            value=3,
+                            step=1,
+                            label="Nombre d'Epochs"
+                        )
+                        ft_batch_size = gr.Slider(
+                            minimum=8,
+                            maximum=32,
+                            value=16,
+                            step=8,
+                            label="Taille des Batchs"
+                        )
+                        ft_wandb_project = gr.Textbox(
+                            value="camembert-fine-tuning",
+                            label="Nom du Projet W&B"
+                        )
+
+                with gr.Row():
+                    start_ft_button = gr.Button("Démarrer le Fine-tuning")
+                    ft_status = gr.Textbox(
+                        label="Statut du Fine-tuning",
+                        interactive=False
+                    )
+
+                gr.Markdown("### Évaluation du Modèle")
+                with gr.Row():
+                    evaluate_button = gr.Button("Évaluer le Modèle")
+                    evaluation_status = gr.Textbox(
+                        label="Résultats de l'Évaluation",
+                        interactive=False
+                    )
+                    confusion_matrix = gr.Image(
+                        label="Matrice de Confusion",
+                        interactive=False
+                    )
+
             # Event Handlers
             load_btn.click(
                     fn=initialize_and_load_dataset,
@@ -482,6 +578,59 @@ class Run_Handler:
                 if self.training_config
                 else "❌ Configuration non initialisée",
                 outputs=[training_status],
+            )
+
+            # Event handlers pour le fine-tuning
+            ft_model_source.change(
+                fn=lambda source: (
+                    [gr.update(visible=source == "Checkpoint Local"),
+                     gr.update(visible=source == "Checkpoint Local"),
+                     gr.update(visible=source == "Modèle HuggingFace")]
+                ),
+                inputs=[ft_model_source],
+                outputs=[ft_available_runs, ft_checkpoints, ft_hf_model]
+            )
+
+            refresh_ft_runs.click(
+                fn=lambda: self._get_run_directories(),
+                outputs=[ft_available_runs]
+            )
+
+            ft_available_runs.change(
+                fn=self._get_available_checkpoints,
+                inputs=[ft_available_runs],
+                outputs=[ft_checkpoints]
+            )
+
+            load_ft_model.click(
+                fn=lambda source, runs, checkpoint, hf_model: self.fine_tuning.load_model_for_fine_tuning(
+                    source, runs, checkpoint, hf_model
+                ),
+                inputs=[ft_model_source, ft_available_runs, ft_checkpoints, ft_hf_model],
+                outputs=[ft_model_status]
+            )
+
+            prepare_dataset.click(
+                fn=lambda dataset: self.fine_tuning.prepare_dataset(dataset),
+                inputs=[ft_dataset],
+                outputs=[dataset_status]
+            )
+
+            start_ft_button.click(
+                fn=lambda *args: self.fine_tuning.start_fine_tuning(*args),
+                inputs=[
+                    ft_wandb_project,
+                    ft_learning_rate,
+                    ft_epochs,
+                    ft_batch_size,
+                    ft_wandb_project
+                ],
+                outputs=[ft_status]
+            )
+
+            evaluate_button.click(
+                fn=lambda: self.fine_tuning.evaluate_model(),
+                outputs=[evaluation_status, confusion_matrix]
             )
 
             return interface
