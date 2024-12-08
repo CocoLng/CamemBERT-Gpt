@@ -14,17 +14,17 @@ class CustomTrainer(Trainer):
         self.dataset_size = data_loader._dataset_size if data_loader else None
         self.checkpoint_steps = checkpoint_steps
         
-        # Récupérer et stocker le tokenizer des kwargs
-        self.tokenizer = kwargs.pop('tokenizer', None)  # Important: on le stocke avant de le retirer
-        if self.tokenizer is None and data_loader is not None:
-            self.tokenizer = data_loader.tokenizer
+        # Utilisation de processing_class au lieu de tokenizer
+        self.processing_class = kwargs.pop('processing_class', None)
+        if self.processing_class is None and data_loader is not None:
+            self.processing_class = data_loader.tokenizer
         
         # Setup directory structure
         self.base_dir = kwargs['args'].output_dir
         self.weights_dir = os.path.join(self.base_dir, "weights")
         os.makedirs(self.weights_dir, exist_ok=True)
         
-        # Override save_steps in training arguments with our checkpoint_steps
+        # Override save_steps in training arguments
         kwargs['args'].save_steps = self.checkpoint_steps
         
         super().__init__(**kwargs)
@@ -101,23 +101,19 @@ class CustomTrainer(Trainer):
             # 1. Save model state and configuration
             super().save_model(checkpoint_dir)
             
-            # 2. Save tokenizer
-            if self.tokenizer is not None:
-                self.tokenizer.save_pretrained(checkpoint_dir)
+            # 2. Save processing_class (tokenizer)
+            if self.processing_class is not None:
+                self.processing_class.save_pretrained(checkpoint_dir)
 
-            # 2. Save optimizer and scheduler states
+            # Save optimizer and scheduler states
             optimizer_states = {
                 'optimizer': self.optimizer.state_dict(),
-                'scheduler': self.lr_scheduler.state_dict() if self.lr_scheduler else None
+                'scheduler': self.lr_scheduler.state_dict() if self.lr_scheduler else None,
+                'scaler': self.scaler.state_dict() if hasattr(self, 'scaler') and self.scaler is not None else None
             }
-            
-            # Add scaler state only if FP16 is enabled
-            if hasattr(self, 'scaler') and self.scaler is not None:
-                optimizer_states['scaler'] = self.scaler.state_dict()
-                
             torch.save(optimizer_states, os.path.join(checkpoint_dir, "optimizer.pt"))
 
-            # 3. Save training state
+            # Save training state
             training_state = {
                 'global_step': self.state.global_step,
                 'epoch': self.state.epoch,
@@ -126,15 +122,13 @@ class CustomTrainer(Trainer):
             }
             torch.save(training_state, os.path.join(checkpoint_dir, "trainer_state.pt"))
             
-            # 4. Save human-readable metrics report
+            # Save metrics report
             self._save_metrics_report(checkpoint_dir)
-
-            self.logger.info(f"Saved comprehensive checkpoint: {checkpoint_dir}")
-
+            
         except Exception as e:
             self.logger.error(f"Error saving checkpoint: {e}")
             raise
-
+        
     def _save_metrics_report(self, checkpoint_dir: str):
         """Save detailed metrics report"""
         try:
@@ -170,20 +164,20 @@ class CustomTrainer(Trainer):
             # Si c'est la sauvegarde finale ou un checkpoint
             save_dir = output_dir if output_dir else self.weights_dir
             
-            # Sauvegarder le tokenizer
-            if self.tokenizer is not None:
+            # Sauvegarder le processing_class (tokenizer)
+            if self.processing_class is not None:
                 self.logger.info(f"Saving tokenizer to {save_dir}")
-                self.tokenizer.save_pretrained(save_dir)
+                self.processing_class.save_pretrained(save_dir)
             else:
-                self.logger.warning("No tokenizer available to save!")
+                self.logger.warning("No processing_class available to save!")
 
             # Si c'est la sauvegarde finale
             if output_dir is None or (output_dir == self.args.output_dir and not _internal_call):
                 self.logger.info("Saving final weights...")
                 self._save_model_info(self.weights_dir)
                 super().save_model(self.weights_dir, _internal_call=True)
-                if self.tokenizer is not None:
-                    self.tokenizer.save_pretrained(self.weights_dir)
+                if self.processing_class is not None:
+                    self.processing_class.save_pretrained(self.weights_dir)
                 self._save_metrics_report(self.weights_dir)
                     
         except Exception as e:
@@ -271,7 +265,7 @@ class TrainingConfig:
                 expected_mlm_probability=self.data_loader.mlm_probability
             )
 
-            # Setup trainer with tokenizer
+            # Setup trainer with processing_class
             self.trainer = CustomTrainer(
                 data_loader=self.data_loader,
                 model=self.model,
@@ -279,7 +273,7 @@ class TrainingConfig:
                 train_dataset=self.data_loader.dataset,
                 data_collator=self.data_loader.data_collator,
                 callbacks=[masking_monitor],
-                tokenizer=self.data_loader.tokenizer  # Ajout du tokenizer ici
+                processing_class=self.data_loader.tokenizer  # Utilisation de processing_class
             )
 
             # Verify setup with the monitor
