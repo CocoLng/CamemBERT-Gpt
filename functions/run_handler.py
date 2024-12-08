@@ -221,9 +221,9 @@ class Run_Handler:
                             label="Nombre d'Epochs",
                         )
                         batch_size = gr.Slider(
-                            minimum=8,
-                            maximum=64,
-                            value=16,
+                            minimum=16,
+                            maximum=80,
+                            value=80,
                             step=8,
                             label="Taille des Batchs",
                         )
@@ -518,9 +518,9 @@ class Run_Handler:
                             label="Nombre d'Epochs"
                         )
                         ft_batch_size = gr.Slider(
-                            minimum=8,
-                            maximum=32,
-                            value=16,
+                            minimum=16,
+                            maximum=80,
+                            value=80,
                             step=8,
                             label="Taille des Batchs"
                         )

@@ -128,7 +128,7 @@ class CustomTrainer(Trainer):
         except Exception as e:
             self.logger.error(f"Error saving checkpoint: {e}")
             raise
-        
+
     def _save_metrics_report(self, checkpoint_dir: str):
         """Save detailed metrics report"""
         try:
@@ -192,6 +192,7 @@ class TrainingConfig:
         self.data_loader = data_loader
         self.trainer = None
         self.model = None
+        self.tokenizer = data_loader.tokenizer  # Important: Stockage explicite du tokenizer
         
         # Setup directories and device
         self.base_dir = "camembert-training"
@@ -261,11 +262,11 @@ class TrainingConfig:
 
             # Setup masking monitor
             masking_monitor = MaskingMonitorCallback(
-                tokenizer=self.data_loader.tokenizer,
+                tokenizer=self.tokenizer,  # Utilisation du tokenizer stocké
                 expected_mlm_probability=self.data_loader.mlm_probability
             )
 
-            # Setup trainer with processing_class
+            # Setup trainer with explicit tokenizer
             self.trainer = CustomTrainer(
                 data_loader=self.data_loader,
                 model=self.model,
@@ -273,7 +274,7 @@ class TrainingConfig:
                 train_dataset=self.data_loader.dataset,
                 data_collator=self.data_loader.data_collator,
                 callbacks=[masking_monitor],
-                processing_class=self.data_loader.tokenizer  # Utilisation de processing_class
+                processing_class=self.tokenizer  # Passage explicite du tokenizer
             )
 
             # Verify setup with the monitor
@@ -282,6 +283,7 @@ class TrainingConfig:
         except Exception as e:
             self.logger.error(f"Error setting up trainer: {e}")
             raise
+
 
     def _verify_training_setup(self, masking_monitor: MaskingMonitorCallback):
         """Verify training setup and masking configuration"""
@@ -327,10 +329,10 @@ class TrainingConfig:
         return within_tolerance
 
     def start_training(self, output_dir: str, num_train_epochs: int, batch_size: int,
-                  learning_rate: float, weight_decay: float, warmup_steps: int,
-                  gradient_accumulation: int, wandb_project: str,
-                  use_cuda: bool, fp16_training: bool, num_workers: int,
-                  max_steps: int) -> str:
+                      learning_rate: float, weight_decay: float, warmup_steps: int,
+                      gradient_accumulation: int, wandb_project: str,
+                      use_cuda: bool, fp16_training: bool, num_workers: int,
+                      max_steps: int) -> str:
         """Start training with specified configuration"""
         try:
             if not self.model:
@@ -345,10 +347,10 @@ class TrainingConfig:
             if fp16_training and not can_use_fp16:
                 self.logger.warning("FP16 requested but not available. Falling back to FP32.")
 
-            # Create training arguments
+            # Create training arguments with explicit output directory
             training_args = TrainingArguments(
                 output_dir=self.run_dir,
-                max_steps=max_steps,  # Utilisation explicite du max_steps
+                max_steps=max_steps,
                 per_device_train_batch_size=batch_size,
                 learning_rate=learning_rate,
                 weight_decay=weight_decay,
@@ -358,22 +360,40 @@ class TrainingConfig:
                 dataloader_num_workers=num_workers if torch.cuda.is_available() else 0,
                 dataloader_pin_memory=torch.cuda.is_available(),
                 report_to="wandb",
-                logging_steps=min(500, max_steps // 20),  # Ajusté en fonction du max_steps
-                save_steps=min(5000, max_steps // 10),    # Ajusté en fonction du max_steps
+                logging_steps=min(500, max_steps // 20),
+                save_steps=min(5000, max_steps // 10)
             )
 
-            # Setup and start training
+            # Setup and start training with explicit tokenizer handling
             self.setup_trainer(training_args)
             self.trainer.train()
-            self.trainer.save_model()
+            
+            # Save final model and tokenizer
+            self._save_final_model()
             
             return "✅ Training completed successfully!"
 
         except Exception as e:
             self.logger.error(f"Training error: {e}")
             if hasattr(self, 'trainer') and self.trainer is not None:
-                self.trainer.save_model()
+                self._save_final_model()  # Tentative de sauvegarde même en cas d'erreur
             return f"❌ Training error: {str(e)}"
+        
+    def _save_final_model(self):
+        """Save final model with explicit tokenizer handling"""
+        try:
+            # Sauvegarder le modèle
+            self.trainer.save_model()
+            
+            # Sauvegarder explicitement le tokenizer dans le dossier weights
+            weights_dir = os.path.join(self.run_dir, "weights")
+            os.makedirs(weights_dir, exist_ok=True)
+            self.tokenizer.save_pretrained(weights_dir)
+            
+            self.logger.info(f"Model and tokenizer saved successfully in {weights_dir}")
+        except Exception as e:
+            self.logger.error(f"Error saving final model: {e}")
+            raise
 
     def stop_training(self):
         """Stop training and cleanup"""
