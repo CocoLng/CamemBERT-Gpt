@@ -8,14 +8,16 @@ from transformers import Trainer, TrainingArguments, RobertaForMaskedLM
 from .masking_monitor import MaskingMonitorCallback
 
 class CustomTrainer(Trainer):
-    
     def __init__(self, data_loader=None, checkpoint_steps=20, **kwargs):
         self.logger = logging.getLogger(__name__)
         self.data_loader = data_loader
         self.dataset_size = data_loader._dataset_size if data_loader else None
         self.checkpoint_steps = checkpoint_steps
         
-        kwargs.pop('tokenizer', None)
+        # Récupérer et stocker le tokenizer des kwargs
+        self.tokenizer = kwargs.pop('tokenizer', None)  # Important: on le stocke avant de le retirer
+        if self.tokenizer is None and data_loader is not None:
+            self.tokenizer = data_loader.tokenizer
         
         # Setup directory structure
         self.base_dir = kwargs['args'].output_dir
@@ -97,7 +99,11 @@ class CustomTrainer(Trainer):
             os.makedirs(checkpoint_dir, exist_ok=True)
 
             # 1. Save model state and configuration
-            super().save_model(checkpoint_dir)  # Utilisation directe de la méthode parent
+            super().save_model(checkpoint_dir)
+            
+            # 2. Save tokenizer
+            if self.tokenizer is not None:
+                self.tokenizer.save_pretrained(checkpoint_dir)
 
             # 2. Save optimizer and scheduler states
             optimizer_states = {
@@ -158,26 +164,27 @@ class CustomTrainer(Trainer):
     def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
         """Save model with enhanced final weights handling"""
         try:
-            # Use parent save_model implementation
+            # Sauvegarder le modèle avec la méthode parent
             super().save_model(output_dir, _internal_call=_internal_call)
 
-            # If this is the final save (not an internal call), save in weights directory
+            # Si c'est la sauvegarde finale ou un checkpoint
+            save_dir = output_dir if output_dir else self.weights_dir
+            
+            # Sauvegarder le tokenizer
+            if self.tokenizer is not None:
+                self.logger.info(f"Saving tokenizer to {save_dir}")
+                self.tokenizer.save_pretrained(save_dir)
+            else:
+                self.logger.warning("No tokenizer available to save!")
+
+            # Si c'est la sauvegarde finale
             if output_dir is None or (output_dir == self.args.output_dir and not _internal_call):
                 self.logger.info("Saving final weights...")
                 self._save_model_info(self.weights_dir)
                 super().save_model(self.weights_dir, _internal_call=True)
-                
-                # Save final metrics report in weights directory
+                if self.tokenizer is not None:
+                    self.tokenizer.save_pretrained(self.weights_dir)
                 self._save_metrics_report(self.weights_dir)
-                
-                # Copy best checkpoint state if exists
-                if self.state.best_model_checkpoint and os.path.exists(self.state.best_model_checkpoint):
-                    for file in ['optimizer.pt', 'trainer_state.pt']:
-                        src = os.path.join(self.state.best_model_checkpoint, file)
-                        if os.path.exists(src):
-                            shutil.copy2(src, os.path.join(self.weights_dir, file))
-                    
-                self.logger.info(f"Final weights and state saved in {self.weights_dir}")
                     
         except Exception as e:
             self.logger.error(f"Error saving model: {e}")
@@ -264,14 +271,15 @@ class TrainingConfig:
                 expected_mlm_probability=self.data_loader.mlm_probability
             )
 
-            # Setup trainer with safe defaults
+            # Setup trainer with tokenizer
             self.trainer = CustomTrainer(
                 data_loader=self.data_loader,
                 model=self.model,
                 args=training_args,
                 train_dataset=self.data_loader.dataset,
                 data_collator=self.data_loader.data_collator,
-                callbacks=[masking_monitor]
+                callbacks=[masking_monitor],
+                tokenizer=self.data_loader.tokenizer  # Ajout du tokenizer ici
             )
 
             # Verify setup with the monitor

@@ -320,6 +320,7 @@ class Run_Handler:
                         interactive=False
                     )
 
+            # Dans la méthode create_interface() :
             with gr.Tab("4. Test du Modèle"):
                 gr.Markdown("### Chargement du Modèle")
                 with gr.Row():
@@ -329,25 +330,97 @@ class Run_Handler:
                             label="Source du modèle",
                             value="Weights"
                         )
-                        # Modification du comportement du dossier source
                         available_runs = gr.Dropdown(
                             label="Run disponibles",
                             choices=self._get_run_directories(),
-                            interactive=True
+                            interactive=True,
+                            value=None  # Important pour Gradio 5.7.2
                         )
                         test_checkpoints = gr.Dropdown(
                             label="Points de restauration disponibles",
-                            choices=[],  # Sera mis à jour dynamiquement
-                            interactive=True
+                            choices=[],
+                            interactive=True,
+                            visible=True
                         )
                         refresh_runs = gr.Button("Rafraîchir les runs")
-                        refresh_test_checkpoints = gr.Button("Rafraîchir les checkpoints")
                         load_test_model = gr.Button("Charger le modèle")
                         model_load_status = gr.Textbox(
                             label="Statut du chargement",
                             interactive=False
                         )
 
+                # Event handlers
+                model_source.change(
+                    fn=lambda source: gr.update(visible=source=="Checkpoint"),
+                    inputs=[model_source],
+                    outputs=[test_checkpoints]
+                )
+
+                # Mise à jour des checkpoints uniquement si nécessaire
+                # Event handlers
+                def update_checkpoints(run_name):
+                    if isinstance(run_name, list):
+                        run_name = run_name[0] if run_name else None
+                    return gr.Dropdown(choices=self._get_available_checkpoints(str(run_name)))
+
+                def handle_model_loading(source, run_name, checkpoint):
+                    if isinstance(run_name, list):
+                        run_name = run_name[0] if run_name else None
+                        
+                    if not run_name:
+                        return "❌ Veuillez sélectionner un run"
+                        
+                    run_dir = os.path.join(self.base_dir, str(run_name))
+                    
+                    if source == "Checkpoint":
+                        if not checkpoint:
+                            return "❌ Veuillez sélectionner un checkpoint"
+                        path = os.path.join(run_dir, str(checkpoint))
+                    else:
+                        path = os.path.join(run_dir, "weights")
+                        
+                    return self._load_model_for_testing(source, run_dir, path)
+
+                # Connect event handlers
+                available_runs.change(
+                    fn=update_checkpoints,
+                    inputs=[available_runs],
+                    outputs=[test_checkpoints]
+                )
+
+                refresh_runs.click(
+                    fn=lambda: gr.Dropdown(choices=self._get_run_directories()),
+                    outputs=[available_runs]
+                )
+
+                load_test_model.click(
+                    fn=handle_model_loading,
+                    inputs=[model_source, available_runs, test_checkpoints],
+                    outputs=[model_load_status]
+                )
+                # Modification de la fonction de chargement du modèle
+                def load_model_handler(source, run_name, checkpoint=None):
+                    """Gère le chargement du modèle en fonction de la source"""
+                    try:
+                        if not run_name:
+                            return "❌ Veuillez sélectionner un run"
+                        
+                        # Construire le chemin complet du run
+                        run_dir = os.path.join(self.base_dir, run_name)
+                        
+                        if source == "Checkpoint":
+                            if not checkpoint:
+                                return "❌ Veuillez sélectionner un checkpoint"
+                            path = os.path.join(run_dir, checkpoint)
+                        else:  # Weights
+                            path = os.path.join(run_dir, "weights")
+                            
+                        return self._load_model_for_testing(source, run_dir, path)
+                        
+                    except Exception as e:
+                        return f"❌ Erreur lors du chargement: {str(e)}"
+
+        
                 gr.Markdown("### Test de Génération de Texte")
                 with gr.Row():
                     with gr.Column():
@@ -511,31 +584,6 @@ class Run_Handler:
                 outputs=[available_checkpoints],
             )
             
-            # Event Handlers pour la nouvelle interface
-            refresh_runs.click(
-                fn=lambda: self._get_run_directories(),
-                outputs=[available_runs]
-            )
-            
-            # Mise à jour automatique des checkpoints quand on change de run
-            available_runs.change(
-                fn=self._get_available_checkpoints,
-                inputs=[available_runs],
-                outputs=[test_checkpoints]
-            )
-
-            refresh_test_checkpoints.click(
-                fn=self._get_available_checkpoints,
-                inputs=[available_runs],
-                outputs=[test_checkpoints]
-            )
-
-            # Modification du handler de chargement
-            load_test_model.click(
-                fn=self._load_model_for_testing,
-                inputs=[model_source, available_runs, test_checkpoints],
-                outputs=[model_load_status]
-            )
             
             load_checkpoint_btn.click(
                 fn=self._get_checkpoint_info,
@@ -636,65 +684,41 @@ class Run_Handler:
             return interface
 
     def _get_run_directories(self) -> List[str]:
-        """Récupère tous les dossiers de runs valides"""
+        """Récupère la liste des runs disponibles"""
         try:
-            if not os.path.exists(self.base_dir):
-                self.logger.warning(f"Dossier de base non trouvé: {self.base_dir}")
-                return []
-                
-            run_dirs = []
-            # Liste tous les dossiers cam_runX
-            for item in os.listdir(self.base_dir):
-                if item.startswith("cam_run"):
-                    full_path = os.path.join(self.base_dir, item)
-                    if os.path.isdir(full_path):
-                        run_dirs.append(full_path)
-                        
-            return sorted(run_dirs, key=lambda x: int(x.split("cam_run")[-1]))
-            
+            runs = []
+            if os.path.exists(self.base_dir):
+                for item in os.listdir(self.base_dir):
+                    if item.startswith("cam_run"):
+                        if os.path.isdir(os.path.join(self.base_dir, item)):
+                            runs.append(item)
+            return sorted(runs, key=lambda x: int(x.split("cam_run")[-1]))
         except Exception as e:
             self.logger.error(f"Erreur lors de la lecture des runs: {e}")
             return []
 
-    def _get_available_checkpoints(self, folder: str) -> List[str]:
-        """Récupère la liste des checkpoints disponibles pour un dossier donné"""
+    def _get_available_checkpoints(self, run_name: str) -> List[str]:
+        """Récupère les checkpoints disponibles pour un run"""
         try:
-            checkpoints = []
-            
-            # 1. Vérifier si c'est un chemin direct vers un run
-            if os.path.basename(folder).startswith("cam_run"):
-                base_path = folder
-            else:
-                # 2. Sinon, construire le chemin complet
-                if not folder.startswith(self.base_dir):
-                    base_path = os.path.join(self.base_dir, folder)
-                else:
-                    base_path = folder
-
-            # 3. Vérifier si le dossier existe
-            if not os.path.exists(base_path):
-                self.logger.warning(f"Dossier non trouvé: {base_path}")
+            if not run_name:
                 return []
-
-            # 4. Ajouter le dossier weights s'il existe et contient les fichiers nécessaires
-            weights_path = os.path.join(base_path, "weights")
-            if os.path.exists(weights_path) and self._is_valid_model_directory(weights_path):
-                checkpoints.append(f"weights")
-
-            # 5. Ajouter les checkpoints valides
-            for item in os.listdir(base_path):
-                if item.startswith("checkpoint-"):
-                    checkpoint_path = os.path.join(base_path, item)
-                    if os.path.isdir(checkpoint_path) and self._is_valid_model_directory(checkpoint_path):
-                        checkpoints.append(item)
-
-            # 6. Trier les checkpoints
-            sorted_checkpoints = sorted(checkpoints, 
-                                     key=lambda x: int(x.split('-')[1]) if x != "weights" else float('inf'))
+                
+            checkpoints = []
+            run_dir = os.path.join(self.base_dir, str(run_name))
             
-            self.logger.info(f"Checkpoints trouvés dans {base_path}: {sorted_checkpoints}")
-            return sorted_checkpoints
-
+            # Vérifier le dossier weights
+            weights_path = os.path.join(run_dir, "weights")
+            if os.path.exists(weights_path):
+                checkpoints.append("weights")
+                
+            # Chercher les checkpoints
+            for item in os.listdir(run_dir):
+                if item.startswith("checkpoint-"):
+                    checkpoint_path = os.path.join(run_dir, item)
+                    if os.path.isdir(checkpoint_path):
+                        checkpoints.append(item)
+                        
+            return sorted(checkpoints)
         except Exception as e:
             self.logger.error(f"Erreur lors de la lecture des checkpoints: {e}")
             return []
@@ -728,18 +752,10 @@ class Run_Handler:
         except Exception as e:
             return f"Erreur lors de la lecture des informations: {str(e)}"
         
-    def _load_model_for_testing(self, source: str, folder: str, checkpoint: str) -> str:
-        """Charge le modèle pour le test depuis un checkpoint ou les weights"""
+        
+    def _load_model_for_testing(self, source: str, folder: str, path: str) -> str:
+        """Charge le modèle pour le test"""
         try:
-            if not folder or not checkpoint:
-                return "❌ Veuillez sélectionner un dossier et un point de restauration"
-
-            # Déterminer le chemin selon la source
-            if source == "Weights":
-                path = os.path.join(folder, "weights")
-            else:
-                path = os.path.join(folder, checkpoint)
-
             if not os.path.exists(path):
                 return f"❌ Chemin non trouvé: {path}"
 
@@ -747,20 +763,15 @@ class Run_Handler:
             model = RobertaForMaskedLM.from_pretrained(path)
             tokenizer = RobertaTokenizerFast.from_pretrained(path)
             
-            # Déplacer le modèle sur GPU si disponible
             if torch.cuda.is_available():
                 model = model.cuda()
             
-            # Mettre à jour le test_predictor
             self.test_predictor = TestPredictor(model, tokenizer)
-            
-            self.logger.info(f"Modèle chargé depuis: {path}")
             return "✅ Modèle chargé avec succès"
             
         except Exception as e:
-            error_msg = f"❌ Erreur lors du chargement: {str(e)}"
-            self.logger.error(error_msg)
-            return error_msg
+            self.logger.error(f"Erreur lors du chargement: {str(e)}")
+            return f"❌ Erreur: {str(e)}"
         
     def _is_valid_model_directory(self, directory: str) -> bool:
         """Vérifie si un dossier contient un modèle valide"""
