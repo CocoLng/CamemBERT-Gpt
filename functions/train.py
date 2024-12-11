@@ -164,7 +164,6 @@ class CustomTrainer(Trainer):
             # Sauvegarder le modèle avec la méthode parent
             super().save_model(output_dir, _internal_call=_internal_call)
 
-            # Si c'est la sauvegarde finale ou un checkpoint
             save_dir = output_dir if output_dir else self.weights_dir
             
             # Sauvegarder le processing_class (tokenizer)
@@ -179,10 +178,10 @@ class CustomTrainer(Trainer):
                 self.logger.info("Saving final weights...")
                 self._save_model_info(self.weights_dir)
                 super().save_model(self.weights_dir, _internal_call=True)
-                if self.processing_class is not None:
-                    self.processing_class.save_pretrained(self.weights_dir)
                 self._save_metrics_report(self.weights_dir)
-                    
+                
+                # Ne pas gérer wandb ici - laissez TrainingConfig le faire
+                
         except Exception as e:
             self.logger.error(f"Error saving model: {e}")
             raise
@@ -336,66 +335,109 @@ class TrainingConfig:
                       gradient_accumulation: int, wandb_project: str,
                       use_cuda: bool, fp16_training: bool, num_workers: int,
                       max_steps: int) -> str:
-        """Start training with specified configuration"""
         try:
             if not self.model:
                 return "❌ Model not initialized"
 
-            # Initialize wandb
-            wandb.init(project=wandb_project, 
-                    name=f"training-run-{os.path.basename(output_dir)}")
+            cuda_available = torch.cuda.is_available() and use_cuda
+            wandb_initialized = False
+            
+            if cuda_available:
+                run_name = os.path.basename(self.run_dir)
+                wandb.init(
+                    project=wandb_project,
+                    name=run_name,
+                    dir=self.run_dir
+                )
+                wandb_initialized = True
 
-            # Determine if FP16 can be used
-            can_use_fp16 = (torch.cuda.is_available() and use_cuda and fp16_training)
-            if fp16_training and not can_use_fp16:
-                self.logger.warning("FP16 requested but not available. Falling back to FP32.")
+            # Calculer le nombre de steps par epoch
+            if self.data_loader and hasattr(self.data_loader, 'dataset'):
+                total_samples = len(self.data_loader.dataset)
+                steps_per_epoch = total_samples // (batch_size * gradient_accumulation)
+                # Calculer le vrai max_steps basé sur le nombre d'epochs demandé
+                effective_max_steps = steps_per_epoch * num_train_epochs
+                # Prendre le minimum entre max_steps demandé et steps nécessaires pour les epochs
+                max_steps = min(max_steps, effective_max_steps) if max_steps > 0 else effective_max_steps
+            else:
+                self.logger.warning("Could not calculate steps per epoch, using provided max_steps")
 
-            # Create training arguments with explicit output directory
+            # Create training arguments
             training_args = TrainingArguments(
                 output_dir=self.run_dir,
+                num_train_epochs=num_train_epochs,  # Ajout du nombre d'epochs
                 max_steps=max_steps,
                 per_device_train_batch_size=batch_size,
                 learning_rate=learning_rate,
                 weight_decay=weight_decay,
                 warmup_steps=warmup_steps,
                 gradient_accumulation_steps=gradient_accumulation,
-                fp16=can_use_fp16,
-                dataloader_num_workers=num_workers if torch.cuda.is_available() else 0,
-                dataloader_pin_memory=torch.cuda.is_available(),
-                report_to="wandb",
+                fp16=cuda_available and fp16_training,
+                dataloader_num_workers=num_workers if cuda_available else 0,
+                dataloader_pin_memory=cuda_available,
+                report_to="wandb" if cuda_available else "none",
                 logging_steps=min(500, max_steps // 20),
                 save_steps=min(5000, max_steps // 10)
             )
 
-            # Setup and start training with explicit tokenizer handling
+            # Setup and start training
             self.setup_trainer(training_args)
             self.trainer.train()
             
             # Save final model and tokenizer
             self._save_final_model()
             
+            # Ne pas finir wandb ici, laissons save_model le faire
             return "✅ Training completed successfully!"
 
         except Exception as e:
             self.logger.error(f"Training error: {e}")
+            if wandb_initialized:
+                wandb.finish()
             if hasattr(self, 'trainer') and self.trainer is not None:
-                self._save_final_model()  # Tentative de sauvegarde même en cas d'erreur
+                self.trainer.save_model()  # Sauvegarder sans gérer wandb
             return f"❌ Training error: {str(e)}"
-        
+
+    
+    # Dans la classe TrainingConfig
+
     def _save_final_model(self):
         """Save final model with explicit tokenizer handling"""
         try:
-            # Sauvegarder le modèle
+            if not self.trainer:
+                return
+                
+            # Sauvegarder d'abord le modèle
             self.trainer.save_model()
             
-            # Sauvegarder explicitement le tokenizer dans le dossier weights
-            weights_dir = os.path.join(self.run_dir, "weights")
-            os.makedirs(weights_dir, exist_ok=True)
-            self.tokenizer.save_pretrained(weights_dir)
+            # Vérifier si wandb est actif
+            if not wandb.run:
+                return
+                
+            # Vérifier si c'est vraiment la fin du training
+            training_finished = (
+                self.trainer.state.global_step >= self.trainer.args.max_steps or
+                self.trainer.state.epoch >= self.trainer.args.num_train_epochs
+            )
+
+            if training_finished:
+                try:
+                    final_metrics = {
+                        "final_loss": self.trainer.state.log_history[-1].get("loss", None),
+                        "total_steps": self.trainer.state.global_step,
+                        "total_epochs": self.trainer.state.epoch,
+                        "training_finished": True
+                    }
+                    wandb.log(final_metrics)
+                except Exception as e:
+                    self.logger.error(f"Error logging final metrics: {e}")
+                finally:
+                    wandb.finish()
             
-            self.logger.info(f"Model and tokenizer saved successfully in {weights_dir}")
         except Exception as e:
-            self.logger.error(f"Error saving final model: {e}")
+            self.logger.error(f"Error in _save_final_model: {e}")
+            if wandb.run:
+                wandb.finish()
             raise
 
     def stop_training(self):
