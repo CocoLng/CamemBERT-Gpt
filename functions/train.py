@@ -8,7 +8,7 @@ from transformers import Trainer, TrainingArguments, RobertaForMaskedLM
 from .masking_monitor import MaskingMonitorCallback
 
 class CustomTrainer(Trainer):
-    def __init__(self, data_loader=None, checkpoint_steps=20, **kwargs):
+    def __init__(self, data_loader=None, checkpoint_steps=5000, **kwargs):
         self.logger = logging.getLogger(__name__)
         self.data_loader = data_loader
         self.dataset_size = data_loader._dataset_size if data_loader else None
@@ -76,6 +76,9 @@ class CustomTrainer(Trainer):
             required_keys = {'input_ids', 'attention_mask', 'labels'}
             if not all(k in inputs for k in required_keys):
                 raise ValueError(f"Missing required keys in inputs: {required_keys - set(inputs.keys())}")
+            
+            if self.state.global_step == 0:
+                self.logger.info(f"Starting training with dataset size: {self.data_loader._dataset_size:,} tokens")
 
             # Use parent's training step
             loss = super().training_step(model, inputs, return_loss)

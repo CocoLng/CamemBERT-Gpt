@@ -140,8 +140,11 @@ class DataLoader:
     def load_streaming_dataset(self, size_gb: float) -> str:
         """Load and process streaming dataset"""
         try:
-            tokens_per_gb = int((1024 * 1024 * 1024) / 4)
+            # Calcul plus précis des tokens par GB
+            tokens_per_gb = int((1024 * 1024 * 1024) / 3.6)  # ~3.6 bytes par token en moyenne
             self._dataset_size = int(size_gb * tokens_per_gb)
+
+            self.logger.info(f"Chargement du dataset de taille: {size_gb} GB ({self._dataset_size:,} tokens)")
 
             base_dataset = load_dataset(
                 self.dataset_config.name,
@@ -153,14 +156,20 @@ class DataLoader:
             if base_dataset is None:
                 raise ValueError(f"Failed to load dataset {self.dataset_config.name}")
 
-            self.dataset = base_dataset.shuffle(buffer_size=self.dataset_config.buffer_size)
-            self.dataset = self._prepare_dataset(self.dataset)
+            # Préparation du dataset
+            self.dataset = self._prepare_dataset(base_dataset)
             
             self.dataset = self.dataset.map(
                 self._tokenize_function,
                 batched=True,
                 remove_columns=['text']
-            ).take(self._dataset_size)
+            )
+
+            # Pour la reproductibilité, on peut garder un seed fixe
+            self.dataset = self.dataset.shuffle(
+                buffer_size=self.dataset_config.buffer_size,
+                seed=42
+            )
             
             masking_stats = self._verify_masking()
             return self._format_loading_status(size_gb, masking_stats)
