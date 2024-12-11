@@ -112,11 +112,7 @@ class Run_Handler:
                     "OSCAR-2301": "oscar-corpus/OSCAR-2301"
                 }
 
-                def initialize_and_load_dataset(
-                    choice: str,
-                    size: float,
-                    prob: float
-                ) -> str:
+                def initialize_and_load_dataset(choice: str, size: float, prob: float) -> str:
                     try:
                         dataset_name = dataset_mapping.get(choice)
                         if not dataset_name:
@@ -132,7 +128,10 @@ class Run_Handler:
                             )
                         )
                         
-                        return self.data_loader.load_with_masking(size, prob)
+                        status = self.data_loader.load_with_masking(size, prob)
+                        # Forcer le rafraîchissement du statut
+                        gr.Info("Dataset loaded successfully")  # Notification visuelle
+                        return status
                         
                     except Exception as e:
                         return f"❌ Erreur: {str(e)}"

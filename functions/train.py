@@ -6,6 +6,7 @@ import torch
 import wandb
 from transformers import Trainer, TrainingArguments, RobertaForMaskedLM
 from .masking_monitor import MaskingMonitorCallback
+from torch.utils.data import DataLoader
 
 class CustomTrainer(Trainer):
     def __init__(self, data_loader=None, checkpoint_steps=5000, **kwargs):
@@ -13,6 +14,7 @@ class CustomTrainer(Trainer):
         self.data_loader = data_loader
         self.dataset_size = data_loader._dataset_size if data_loader else None
         self.checkpoint_steps = checkpoint_steps
+        self.tokens_processed = 0
         
         # Utilisation de processing_class au lieu de tokenizer
         self.processing_class = kwargs.pop('processing_class', None)
@@ -31,6 +33,38 @@ class CustomTrainer(Trainer):
         
         # Save initial configuration
         self._save_model_info(self.base_dir)
+
+    def get_train_dataloader(self):
+        """Create streaming dataloader with proper handling"""
+        try:
+            if not self.data_loader or not self.data_loader.dataset:
+                raise ValueError("Dataset stream not configured")
+            
+            self.logger.info("Setting up training dataloader...")
+            
+            # Debug first batch
+            sample_iter = iter(self.data_loader.dataset)
+            first_batch = next(sample_iter)
+            self.logger.info(f"First batch keys: {first_batch.keys()}")
+            
+            dataloader = DataLoader(
+                self.data_loader.dataset,
+                batch_size=self.args.per_device_train_batch_size,
+                collate_fn=self.data_loader.data_collator,
+                num_workers=self.args.dataloader_num_workers,
+                pin_memory=True if torch.cuda.is_available() else False
+            )
+            
+            # Test first batch from dataloader
+            test_iter = iter(dataloader)
+            test_batch = next(test_iter)
+            self.logger.info(f"Test batch keys after collate: {test_batch.keys()}")
+            
+            return dataloader
+            
+        except Exception as e:
+            self.logger.error(f"Error setting up dataloader: {e}")
+            raise
 
     def _save_model_info(self, directory: str):
         """Save comprehensive model information"""
@@ -70,15 +104,20 @@ class CustomTrainer(Trainer):
             self.logger.error(f"Error saving model info: {e}")
 
     def training_step(self, model, inputs, return_loss=True):
-        """Training step with checkpoint management"""
+        """Enhanced training step with streaming support"""
         try:
             # Validate inputs
             required_keys = {'input_ids', 'attention_mask', 'labels'}
             if not all(k in inputs for k in required_keys):
                 raise ValueError(f"Missing required keys in inputs: {required_keys - set(inputs.keys())}")
             
+            # Track processed tokens
+            self.tokens_processed += inputs['input_ids'].size(0) * inputs['input_ids'].size(1)
+            
+            # Logging au début de l'entraînement
             if self.state.global_step == 0:
-                self.logger.info(f"Starting training with dataset size: {self.data_loader._dataset_size:,} tokens")
+                self.logger.info(f"Starting training with target size: {self.dataset_size:,} tokens")
+                self.logger.info(f"Using streaming dataset from: {self.data_loader.dataset_config.name}")
 
             # Use parent's training step
             loss = super().training_step(model, inputs, return_loss)
@@ -86,8 +125,12 @@ class CustomTrainer(Trainer):
             # Create comprehensive checkpoint at save_steps
             if self.state.global_step > 0 and self.state.global_step % self.checkpoint_steps == 0:
                 checkpoint_dir = os.path.join(self.base_dir, f"checkpoint-{self.state.global_step}")
-                if not os.path.exists(checkpoint_dir):  # Évite les sauvegardes multiples
+                if not os.path.exists(checkpoint_dir):
                     self._save_comprehensive_checkpoint(checkpoint_dir)
+                    
+                # Log progression
+                progress = self.tokens_processed / self.dataset_size * 100
+                self.logger.info(f"Progress: {progress:.2f}% ({self.tokens_processed:,}/{self.dataset_size:,} tokens)")
             
             return loss
             
@@ -97,7 +140,7 @@ class CustomTrainer(Trainer):
 
 
     def _save_comprehensive_checkpoint(self, checkpoint_dir: str):
-        """Save comprehensive checkpoint with all necessary information"""
+        """Save comprehensive checkpoint with stream handling"""
         try:
             os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -108,24 +151,18 @@ class CustomTrainer(Trainer):
             if self.processing_class is not None:
                 self.processing_class.save_pretrained(checkpoint_dir)
 
-            # Save optimizer and scheduler states
-            optimizer_states = {
-                'optimizer': self.optimizer.state_dict(),
-                'scheduler': self.lr_scheduler.state_dict() if self.lr_scheduler else None,
-                'scaler': self.scaler.state_dict() if hasattr(self, 'scaler') and self.scaler is not None else None
-            }
-            torch.save(optimizer_states, os.path.join(checkpoint_dir, "optimizer.pt"))
-
-            # Save training state
+            # 3. Save training state with stream information
             training_state = {
                 'global_step': self.state.global_step,
                 'epoch': self.state.epoch,
+                'tokens_processed': self.tokens_processed,
+                'target_size': self.dataset_size,
                 'log_history': self.state.log_history,
                 'best_model_checkpoint': self.state.best_model_checkpoint
             }
             torch.save(training_state, os.path.join(checkpoint_dir, "trainer_state.pt"))
             
-            # Save metrics report
+            # 4. Save detailed metrics
             self._save_metrics_report(checkpoint_dir)
             
         except Exception as e:
@@ -254,17 +291,32 @@ class TrainingConfig:
             raise
 
     def setup_trainer(self, training_args: TrainingArguments):
-        """Setup trainer with monitoring and validation"""
         try:
             if not self.data_loader.is_ready():
                 raise ValueError("Dataset not loaded")
+
+            # Vérifier que les données sont correctement tokenisées
+            sample_batch = next(iter(self.data_loader.dataset))
+            required_fields = {'input_ids', 'attention_mask', 'special_tokens_mask'}
+            
+            if not all(field in sample_batch for field in required_fields):
+                missing_fields = required_fields - set(sample_batch.keys())
+                raise ValueError(f"Dataset stream missing required fields: {missing_fields}")
+                
+            # Vérifier que le collate_fn fonctionne
+            test_batch = self.data_loader.data_collator([sample_batch])
+            required_batch_fields = {'input_ids', 'attention_mask', 'labels'}
+            
+            if not all(k in test_batch for k in required_batch_fields):
+                missing_batch_fields = required_batch_fields - set(test_batch.keys())
+                raise ValueError(f"Invalid batch structure after collate_fn. Missing: {missing_batch_fields}")
 
             if not self.model:
                 self._initialize_model()
 
             # Setup masking monitor
             masking_monitor = MaskingMonitorCallback(
-                tokenizer=self.tokenizer,  # Utilisation du tokenizer stocké
+                tokenizer=self.tokenizer,
                 expected_mlm_probability=self.data_loader.mlm_probability
             )
 
@@ -276,12 +328,12 @@ class TrainingConfig:
                 train_dataset=self.data_loader.dataset,
                 data_collator=self.data_loader.data_collator,
                 callbacks=[masking_monitor],
-                processing_class=self.tokenizer  # Passage explicite du tokenizer
+                processing_class=self.tokenizer
             )
 
             # Verify setup with the monitor
             self._verify_training_setup(masking_monitor)
-                
+                    
         except Exception as e:
             self.logger.error(f"Error setting up trainer: {e}")
             raise
@@ -352,13 +404,13 @@ class TrainingConfig:
                 wandb_initialized = True
 
             # Calculer le nombre de steps par epoch
-            if self.data_loader and hasattr(self.data_loader, 'dataset'):
-                total_samples = len(self.data_loader.dataset)
-                steps_per_epoch = total_samples // (batch_size * gradient_accumulation)
-                # Calculer le vrai max_steps basé sur le nombre d'epochs demandé
-                effective_max_steps = steps_per_epoch * num_train_epochs
-                # Prendre le minimum entre max_steps demandé et steps nécessaires pour les epochs
-                max_steps = min(max_steps, effective_max_steps) if max_steps > 0 else effective_max_steps
+            # Au lieu de calculer basé sur len(dataset), utiliser la taille estimée
+            if self.data_loader:
+                estimated_tokens = self.data_loader.dataset_size
+                tokens_per_batch = batch_size * 512 
+                estimated_steps = estimated_tokens // tokens_per_batch
+                steps_per_epoch = estimated_steps // num_train_epochs
+                max_steps = min(max_steps, estimated_steps) if max_steps > 0 else estimated_steps
             else:
                 self.logger.warning("Could not calculate steps per epoch, using provided max_steps")
 
@@ -381,25 +433,25 @@ class TrainingConfig:
             )
 
             # Setup and start training
+            self.logger.info("Setting up trainer...")
             self.setup_trainer(training_args)
+            
+            self.logger.info("Starting training...")
             self.trainer.train()
             
             # Save final model and tokenizer
             self._save_final_model()
             
-            # Ne pas finir wandb ici, laissons save_model le faire
             return "✅ Training completed successfully!"
 
         except Exception as e:
             self.logger.error(f"Training error: {e}")
+            self.logger.exception("Full traceback:") 
             if wandb_initialized:
                 wandb.finish()
             if hasattr(self, 'trainer') and self.trainer is not None:
-                self.trainer.save_model()  # Sauvegarder sans gérer wandb
+                self.trainer.save_model()
             return f"❌ Training error: {str(e)}"
-
-    
-    # Dans la classe TrainingConfig
 
     def _save_final_model(self):
         """Save final model with explicit tokenizer handling"""
