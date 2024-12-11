@@ -212,13 +212,6 @@ class Run_Handler:
                             value="camembert-training", 
                             label="Dossier de Sortie"
                         )
-                        num_train_epochs = gr.Slider(
-                            minimum=1,
-                            maximum=10,
-                            value=3,
-                            step=1,
-                            label="Nombre d'Epochs",
-                        )
                         batch_size = gr.Slider(
                             minimum=16,
                             maximum=80,
@@ -226,23 +219,6 @@ class Run_Handler:
                             step=8,
                             label="Taille des Batchs",
                         )
-                        learning_rate = gr.Slider(
-                            minimum=1e-6,
-                            maximum=1e-4,
-                            value=5e-5,
-                            step=1e-6,
-                            label="Learning Rate",
-                        )
-                        max_steps = gr.Slider(
-                            minimum=1000,
-                            maximum=100000,
-                            value=10000,
-                            step=1000,
-                            label="Nombre Maximum de Steps",
-                            info="Défaut: 10000"
-                        )
-
-                    with gr.Column():
                         use_cuda = gr.Checkbox(
                             value=True,
                             label="Utiliser CUDA (si disponible)",
@@ -253,27 +229,6 @@ class Run_Handler:
                             label="Utiliser Mixed Precision (FP16)",
                             interactive=True,
                         )
-                        weight_decay = gr.Slider(
-                            minimum=0.0,
-                            maximum=0.1,
-                            value=0.01,
-                            step=0.01,
-                            label="Weight Decay",
-                        )
-                        warmup_steps = gr.Slider(
-                            minimum=0,
-                            maximum=20000,
-                            value=10000,
-                            step=1000,
-                            label="Warmup Steps",
-                        )
-                        gradient_accumulation = gr.Slider(
-                            minimum=1,
-                            maximum=8,
-                            value=4,
-                            step=1,
-                            label="Gradient Accumulation Steps",
-                        )
                         num_workers = gr.Slider(
                             minimum=0,
                             maximum=8,
@@ -282,11 +237,16 @@ class Run_Handler:
                             label="Nombre de Workers pour DataLoader",
                         )
 
-                with gr.Row():
-                    wandb_project = gr.Textbox(
-                        value="camembert-training", 
-                        label="Nom du Projet W&B"
-                    )
+                    with gr.Column():
+                        training_config_display = gr.TextArea(
+                            label="Configuration d'Entraînement Calculée",
+                            interactive=False,
+                            lines=12
+                        )
+                        wandb_project = gr.Textbox(
+                            value="camembert-training", 
+                            label="Nom du Projet W&B"
+                        )
 
                 # Nouvelle section pour les checkpoints
                 gr.Markdown("### Gestion des Checkpoints")
@@ -298,11 +258,11 @@ class Run_Handler:
                             interactive=True
                         )
                         available_checkpoints = gr.Dropdown(
-                        label="Checkpoints disponibles",
-                        choices=["weights"],  # Valeur par défaut
-                        interactive=True,
-                        allow_custom_value=False  # Empêche les valeurs personnalisées
-                    )
+                            label="Checkpoints disponibles",
+                            choices=["weights"],  # Valeur par défaut
+                            interactive=True,
+                            allow_custom_value=False  # Empêche les valeurs personnalisées
+                        )
                         refresh_checkpoints = gr.Button("Rafraîchir la liste")
                         load_checkpoint_btn = gr.Button("Charger Checkpoint")
                         checkpoint_info = gr.TextArea(
@@ -318,6 +278,16 @@ class Run_Handler:
                         label="Statut de l'Entraînement", 
                         interactive=False
                     )
+
+                # Event handlers
+                def update_training_config(batch_size):
+                    if hasattr(self, 'training_config') and self.training_config and self.data_loader.is_ready():
+                        try:
+                            params = self.training_config._calculate_training_parameters(batch_size)
+                            return params['log_message']
+                        except Exception as e:
+                            return f"Erreur de calcul des paramètres: {str(e)}"
+                    return "Veuillez d'abord charger le dataset et initialiser le modèle"
 
             # Dans la méthode create_interface() :
             with gr.Tab("4. Test du Modèle"):
@@ -561,20 +531,28 @@ class Run_Handler:
                 )
 
             init_model_btn.click(
-                fn=lambda *args: self.model_config.initialize_full_config(
-                    *args, run_handler=self
-                ),
-                inputs=[
-                    vocab_size,
-                    hidden_size,
-                    num_attention_heads,
-                    num_hidden_layers,
-                    intermediate_size,
-                    hidden_dropout_prob,
-                    attention_probs_dropout_prob,
-                ],
-                outputs=[model_status],
-            )
+            fn=lambda *args: (
+                self.model_config.initialize_full_config(*args, run_handler=self),
+                update_training_config(batch_size.value)  # Ajout de cette ligne
+            ),
+            inputs=[
+                vocab_size,
+                hidden_size,
+                num_attention_heads,
+                num_hidden_layers,
+                intermediate_size,
+                hidden_dropout_prob,
+                attention_probs_dropout_prob,
+            ],
+            outputs=[model_status, training_config_display],  # Ajout de training_config_display
+        )
+
+            # Event handlers pour les checkpoints
+            batch_size.change(
+            fn=update_training_config,
+            inputs=[batch_size],
+            outputs=[training_config_display]
+        )
 
             # Event handlers pour les checkpoints
             refresh_checkpoints.click(
@@ -583,20 +561,10 @@ class Run_Handler:
                 outputs=[available_checkpoints],
             )
             
-            
             load_checkpoint_btn.click(
                 fn=self._get_checkpoint_info,
                 inputs=[checkpoint_folder, available_checkpoints],
                 outputs=[checkpoint_info]
-            )
-            
-
-            predict_btn.click(
-                fn=lambda *args: self.test_predictor.predict_and_display(*args)
-                if self.test_predictor
-                else ("Modèle non initialisé", "Veuillez d'abord charger un modèle"),
-                inputs=[input_text, num_tokens, top_k],
-                outputs=[predicted_text, predictions_display],
             )
 
             start_training_btn.click(
@@ -605,17 +573,11 @@ class Run_Handler:
                 else "❌ Configuration non initialisée",
                 inputs=[
                     output_dir,
-                    num_train_epochs,
                     batch_size,
-                    learning_rate,
-                    weight_decay,
-                    warmup_steps,
-                    gradient_accumulation,
                     wandb_project,
                     use_cuda,
                     fp16_training,
-                    num_workers,
-                    max_steps,
+                    num_workers
                 ],
                 outputs=[training_status],
             )
@@ -625,6 +587,15 @@ class Run_Handler:
                 if self.training_config
                 else "❌ Configuration non initialisée",
                 outputs=[training_status],
+            )
+            
+
+            predict_btn.click(
+                fn=lambda *args: self.test_predictor.predict_and_display(*args)
+                if self.test_predictor
+                else ("Modèle non initialisé", "Veuillez d'abord charger un modèle"),
+                inputs=[input_text, num_tokens, top_k],
+                outputs=[predicted_text, predictions_display],
             )
 
             # Event handlers pour le fine-tuning

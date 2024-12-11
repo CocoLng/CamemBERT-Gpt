@@ -381,76 +381,138 @@ class TrainingConfig:
             )
             
         return within_tolerance
+    
+    def _calculate_training_parameters(self, batch_size: int) -> dict:
+        """
+        Calcule les paramètres d'entraînement optimaux pour OSCAR/mOSCAR
+        Version corrigée avec séparation des paramètres
+        """
+        if not self.data_loader or not self.data_loader.dataset_size:
+            raise ValueError("Dataset non initialisé")
 
-    def start_training(self, output_dir: str, num_train_epochs: int, batch_size: int,
-                      learning_rate: float, weight_decay: float, warmup_steps: int,
-                      gradient_accumulation: int, wandb_project: str,
-                      use_cuda: bool, fp16_training: bool, num_workers: int,
-                      max_steps: int) -> str:
+        # Calculs de base
+        tokens_per_batch = batch_size * 512
+        total_batches = self.data_loader.dataset_size // tokens_per_batch
+        dataset_size_gb = self.data_loader.dataset_size * 4 / (1024**3)
+        
+        # Paramètres selon la taille
+        if dataset_size_gb < 10:  # 1-10GB
+            num_epochs = 5
+            learning_rate = 1e-5
+            warmup_ratio = 0.1
+            gradient_acc = 1
+        elif dataset_size_gb < 50:  # 10-50GB
+            num_epochs = 3
+            learning_rate = 3e-5
+            warmup_ratio = 0.07
+            gradient_acc = 2
+        else:  # 50GB+
+            num_epochs = 2
+            learning_rate = 5e-5
+            warmup_ratio = 0.05
+            gradient_acc = 4
+            
+        # Calcul steps
+        total_steps = total_batches * num_epochs // gradient_acc
+        warmup_steps = int(total_steps * warmup_ratio)
+        
+        # Sauvegarde adaptative
+        hours_per_step = 2.5 / 3600  # estimation
+        hours_between_saves = 1
+        target_save_steps = int(hours_between_saves / hours_per_step)
+        save_steps = min(max(1000, target_save_steps), total_steps // 20)
+        logging_steps = save_steps // 5
+
+        # Séparer les paramètres d'entraînement des informations de logging
+        training_args = {
+            'num_train_epochs': num_epochs,
+            'max_steps': total_steps,
+            'warmup_steps': warmup_steps,
+            'learning_rate': learning_rate,
+            'gradient_accumulation_steps': gradient_acc,
+            'save_steps': save_steps,
+            'logging_steps': logging_steps,
+            'weight_decay': 0.01,
+            'per_device_train_batch_size': batch_size
+        }
+        
+        # Informations supplémentaires pour le logging
+        info = {
+            'dataset_size_gb': dataset_size_gb,
+            'total_batches': total_batches,
+            'estimated_hours': total_steps * hours_per_step
+        }
+        
+        # Message pour l'affichage
+        log_message = (
+            f"Configuration calculée pour {dataset_size_gb:.1f}GB:\n"
+            f"- Batches totaux: {total_batches:,}\n"
+            f"- Epochs: {num_epochs}\n"
+            f"- Steps effectifs: {total_steps:,}\n"
+            f"- Warmup steps: {warmup_steps:,} ({warmup_ratio*100:.1f}%)\n"
+            f"- Learning rate: {learning_rate}\n"
+            f"- Gradient accumulation: {gradient_acc}\n"
+            f"- Sauvegarde tous les {save_steps:,} steps (~{hours_between_saves:.1f}h)\n"
+            f"- Log tous les {logging_steps:,} steps\n"
+            f"- Temps d'entraînement estimé: {info['estimated_hours']:.1f}h"
+        )
+        
+        return {
+            'training_args': training_args,
+            'info': info,
+            'log_message': log_message
+        }
+
+    def start_training(self, output_dir: str, batch_size: int,
+                  wandb_project: str, use_cuda: bool, 
+                  fp16_training: bool, num_workers: int) -> str:
         try:
             if not self.model:
                 return "❌ Model not initialized"
 
-            cuda_available = torch.cuda.is_available() and use_cuda
-            wandb_initialized = False
+            # Calcul des paramètres
+            params = self._calculate_training_parameters(batch_size)
+            training_args = params['training_args']
             
+            cuda_available = torch.cuda.is_available() and use_cuda
+            
+            # Initialize wandb with detailed config
             if cuda_available:
                 run_name = os.path.basename(self.run_dir)
                 wandb.init(
                     project=wandb_project,
                     name=run_name,
-                    dir=self.run_dir
+                    dir=self.run_dir,
+                    config={
+                        **training_args,
+                        **params['info'],
+                        'model_config': self.model.config.to_dict()
+                    }
                 )
-                wandb_initialized = True
-
-            # Calculer le nombre de steps par epoch
-            # Au lieu de calculer basé sur len(dataset), utiliser la taille estimée
-            if self.data_loader:
-                estimated_tokens = self.data_loader.dataset_size
-                tokens_per_batch = batch_size * 512 
-                estimated_steps = estimated_tokens // tokens_per_batch
-                steps_per_epoch = estimated_steps // num_train_epochs
-                max_steps = min(max_steps, estimated_steps) if max_steps > 0 else estimated_steps
-            else:
-                self.logger.warning("Could not calculate steps per epoch, using provided max_steps")
 
             # Create training arguments
             training_args = TrainingArguments(
                 output_dir=self.run_dir,
-                num_train_epochs=num_train_epochs,  # Ajout du nombre d'epochs
-                max_steps=max_steps,
-                per_device_train_batch_size=batch_size,
-                learning_rate=learning_rate,
-                weight_decay=weight_decay,
-                warmup_steps=warmup_steps,
-                gradient_accumulation_steps=gradient_accumulation,
+                **training_args,
                 fp16=cuda_available and fp16_training,
                 dataloader_num_workers=num_workers if cuda_available else 0,
                 dataloader_pin_memory=cuda_available,
                 report_to="wandb" if cuda_available else "none",
-                logging_steps=min(500, max_steps // 20),
-                save_steps=min(5000, max_steps // 10)
             )
 
-            # Setup and start training
             self.logger.info("Setting up trainer...")
             self.setup_trainer(training_args)
             
             self.logger.info("Starting training...")
             self.trainer.train()
             
-            # Save final model and tokenizer
             self._save_final_model()
             
             return "✅ Training completed successfully!"
 
         except Exception as e:
             self.logger.error(f"Training error: {e}")
-            self.logger.exception("Full traceback:") 
-            if wandb_initialized:
-                wandb.finish()
-            if hasattr(self, 'trainer') and self.trainer is not None:
-                self.trainer.save_model()
+            self.logger.exception("Full traceback:")
             return f"❌ Training error: {str(e)}"
 
     def _save_final_model(self):
