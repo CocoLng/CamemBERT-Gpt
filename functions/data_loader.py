@@ -140,11 +140,14 @@ class DataLoader:
     def load_streaming_dataset(self, size_gb: float) -> str:
         """Load and process streaming dataset"""
         try:
-            # Calcul plus précis des tokens par GB
-            tokens_per_gb = int((1024 * 1024 * 1024) / 3.6)  # ~3.6 bytes par token en moyenne
-            self._dataset_size = int(size_gb * tokens_per_gb)
-
-            self.logger.info(f"Chargement du dataset de taille: {size_gb} GB ({self._dataset_size:,} tokens)")
+            # On calcule une estimation du nombre d'exemples nécessaires
+            # En considérant une moyenne de 100 tokens par exemple (à ajuster selon vos données)
+            tokens_per_gb = int((1024 * 1024 * 1024) / 3.6)
+            desired_tokens = int(size_gb * tokens_per_gb)
+            estimated_examples = desired_tokens // 100  
+            
+            self.logger.info(f"Loading approximately {size_gb}GB of data...")
+            self.logger.info(f"Estimated examples needed: {estimated_examples:,}")
 
             base_dataset = load_dataset(
                 self.dataset_config.name,
@@ -152,24 +155,30 @@ class DataLoader:
                 split=self.dataset_config.split,
                 streaming=True
             )
-            
-            if base_dataset is None:
-                raise ValueError(f"Failed to load dataset {self.dataset_config.name}")
 
-            # Préparation du dataset
-            self.dataset = self._prepare_dataset(base_dataset)
+            # On garde un compteur de tokens
+            total_tokens = 0
+            processed_examples = []
             
-            self.dataset = self.dataset.map(
-                self._tokenize_function,
-                batched=True,
-                remove_columns=['text']
-            )
-
-            # Pour la reproductibilité, on peut garder un seed fixe
-            self.dataset = self.dataset.shuffle(
-                buffer_size=self.dataset_config.buffer_size,
-                seed=42
-            )
+            # On traite les exemples un par un jusqu'à atteindre la taille voulue
+            for example in base_dataset:
+                processed = self._tokenize_function(example)
+                num_tokens = len(processed['input_ids'])
+                
+                if total_tokens + num_tokens > desired_tokens:
+                    break
+                    
+                total_tokens += num_tokens
+                processed_examples.append(processed)
+                
+                if len(processed_examples) % 1000 == 0:
+                    self.logger.info(f"Processed {len(processed_examples):,} examples, {total_tokens:,} tokens")
+                    
+            # On crée le dataset final
+            self.dataset = Dataset.from_list(processed_examples)
+            self._dataset_size = total_tokens
+            
+            self.logger.info(f"Final dataset size: {total_tokens:,} tokens (~{total_tokens * 3.6 / (1024**3):.2f}GB)")
             
             masking_stats = self._verify_masking()
             return self._format_loading_status(size_gb, masking_stats)
