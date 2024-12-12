@@ -104,36 +104,62 @@ class CustomTrainer(Trainer):
             self.logger.error(f"Error saving model info: {e}")
 
     def training_step(self, model, inputs, return_loss=True):
-        """Enhanced training step with streaming support"""
+        """Training step with optimal monitoring and performance"""
         try:
-            # Validate inputs
+            # Validate inputs (validation critique pour le streaming)
             required_keys = {'input_ids', 'attention_mask', 'labels'}
             if not all(k in inputs for k in required_keys):
-                raise ValueError(f"Missing required keys in inputs: {required_keys - set(inputs.keys())}")
-            
-            # Track processed tokens
-            self.tokens_processed += inputs['input_ids'].size(0) * inputs['input_ids'].size(1)
-            
-            # Logging au début de l'entraînement
-            if self.state.global_step == 0:
-                self.logger.info(f"Starting training with target size: {self.dataset_size:,} tokens")
-                self.logger.info(f"Using streaming dataset from: {self.data_loader.dataset_config.name}")
+                raise ValueError(f"Missing required keys: {required_keys - set(inputs.keys())}")
 
-            # Use parent's training step
+            # Calcul efficace des tokens traités
+            tokens_in_batch = inputs['input_ids'].size(0) * inputs['input_ids'].size(1)
+            self.tokens_processed += tokens_in_batch
+
+            # Initial logging (une seule fois)
+            if self.state.global_step == 0:
+                self.logger.info(
+                    f"Training started - Target: {self.dataset_size:,} tokens, "
+                    f"Dataset: {self.data_loader.dataset_config.name}"
+                )
+
+            # Get loss with vérification de validité
             loss = super().training_step(model, inputs, return_loss)
-            
-            # Create comprehensive checkpoint at save_steps
-            if self.state.global_step > 0 and self.state.global_step % self.checkpoint_steps == 0:
-                checkpoint_dir = os.path.join(self.base_dir, f"checkpoint-{self.state.global_step}")
+            if not torch.isfinite(loss):
+                self.logger.warning(
+                    f"Non-finite loss detected at step {self.state.global_step}: {loss.item()}"
+                )
+                if self.state.global_step > 0:  # Évite l'arrêt au premier step
+                    raise ValueError("Training stopped due to non-finite loss")
+
+            # Gestion optimisée des checkpoints et logging
+            if (self.state.global_step > 0 and 
+                self.state.global_step % self.checkpoint_steps == 0):
+                
+                # Calcul de la progression
+                progress = min(100, self.tokens_processed / self.dataset_size * 100)
+                
+                # Calcul de la moyenne des losses récentes (utilise l'historique existant)
+                recent_losses = [log.get('loss', 0) for log in self.state.log_history[-10:]]
+                avg_loss = sum(recent_losses) / len(recent_losses) if recent_losses else 0
+                
+                # Log concis mais informatif
+                self.logger.info(
+                    f"Progress: {progress:.1f}% | "
+                    f"Step: {self.state.global_step} | "
+                    f"Loss: {loss.item():.4f} (avg: {avg_loss:.4f}) | "
+                    f"Tokens: {self.tokens_processed:,}/{self.dataset_size:,}"
+                )
+                
+                # Sauvegarde checkpoint si nécessaire
+                checkpoint_dir = os.path.join(
+                    self.base_dir, 
+                    f"checkpoint-{self.state.global_step}"
+                )
                 if not os.path.exists(checkpoint_dir):
                     self._save_comprehensive_checkpoint(checkpoint_dir)
-                    
-                # Log progression
-                progress = self.tokens_processed / self.dataset_size * 100
-                self.logger.info(f"Progress: {progress:.2f}% ({self.tokens_processed:,}/{self.dataset_size:,} tokens)")
-            
+
             return loss
-            
+
         except Exception as e:
             self.logger.error(f"Error in training step: {e}")
             raise
@@ -384,83 +410,100 @@ class TrainingConfig:
     
     def _calculate_training_parameters(self, batch_size: int) -> dict:
         """
-        Calcule les paramètres d'entraînement optimaux pour OSCAR/mOSCAR
-        Version corrigée avec séparation des paramètres
+        Calculate training parameters for OSCAR/mOSCAR with adaptive stopping criteria
         """
         if not self.data_loader or not self.data_loader.dataset_size:
             raise ValueError("Dataset non initialisé")
 
-        # Calculs de base
+        # Calculs de base avec meilleure précision
         tokens_per_batch = batch_size * 512
         total_batches = self.data_loader.dataset_size // tokens_per_batch
         dataset_size_gb = self.data_loader.dataset_size * 4 / (1024**3)
         
-        # Paramètres selon la taille
-        if dataset_size_gb < 10:  # 1-10GB
-            num_epochs = 5
-            learning_rate = 1e-5
-            warmup_ratio = 0.1
+        # Récupération des paramètres du modèle
+        hidden_size = self.model_config.config.hidden_size
+        num_layers = self.model_config.config.num_hidden_layers
+        
+        # Calcul du gradient accumulation selon la taille des données
+        if dataset_size_gb < 10:
             gradient_acc = 1
-        elif dataset_size_gb < 50:  # 10-50GB
-            num_epochs = 3
-            learning_rate = 3e-5
-            warmup_ratio = 0.07
-            gradient_acc = 2
-        else:  # 50GB+
-            num_epochs = 2
-            learning_rate = 5e-5
-            warmup_ratio = 0.05
-            gradient_acc = 4
+        elif dataset_size_gb < 50:
+            gradient_acc = min(2, batch_size // 8)
+        else:
+            gradient_acc = min(4, batch_size // 4)
             
-        # Calcul steps
-        total_steps = total_batches * num_epochs // gradient_acc
+        # Calcul de la taille effective du batch
+        effective_batch = batch_size * gradient_acc
+        
+        # Learning rate adaptatif basé sur l'architecture et la taille du batch
+        base_lr = 1e-5
+        architecture_scale = (768 / hidden_size) * (12 / num_layers) ** 0.5
+        batch_scale = (effective_batch / 256) ** 0.5
+        
+        if dataset_size_gb < 10:
+            learning_rate = base_lr * architecture_scale * batch_scale
+            max_steps = 100000  # Critère d'arrêt maximum
+        elif dataset_size_gb < 50:
+            learning_rate = (2.5 * base_lr) * architecture_scale * batch_scale
+            max_steps = 200000
+        else:
+            learning_rate = (4 * base_lr) * architecture_scale * batch_scale
+            max_steps = 300000
+            
+        # Calcul du nombre optimal d'epochs et des steps
+        tokens_per_epoch = self.data_loader.dataset_size
+        updates_per_epoch = tokens_per_epoch // (effective_batch * 512)
+        
+        if dataset_size_gb < 10:
+            min_updates = 10000
+            num_epochs = min(5, max(3, min_updates // updates_per_epoch))
+        elif dataset_size_gb < 50:
+            min_updates = 25000
+            num_epochs = min(3, max(2, min_updates // updates_per_epoch))
+        else:
+            min_updates = 50000
+            num_epochs = min(2, max(1, min_updates // updates_per_epoch))
+        
+        # Calcul des steps avec critères d'arrêt
+        total_steps = min(max_steps, updates_per_epoch * num_epochs)
+        warmup_ratio = min(0.1, 0.06 * (effective_batch / 256))
         warmup_steps = int(total_steps * warmup_ratio)
         
-        # Sauvegarde adaptative
-        hours_per_step = 2.5 / 3600  # estimation
-        hours_between_saves = 1
-        target_save_steps = int(hours_between_saves / hours_per_step)
-        save_steps = min(max(1000, target_save_steps), total_steps // 20)
+        # Optimisation de la fréquence de sauvegarde
+        updates_per_hour = 3600 / (2.5 * (effective_batch / 256))
+        min_save_frequency = max(0.5, min(2.0, dataset_size_gb / 20))
+        save_steps = max(100, int(updates_per_hour * min_save_frequency))
+        save_steps = max(save_steps, total_steps // 50)  # Maximum 50 sauvegardes
         logging_steps = save_steps // 5
 
-        # Séparer les paramètres d'entraînement des informations de logging
-        training_args = {
-            'num_train_epochs': num_epochs,
-            'max_steps': total_steps,
-            'warmup_steps': warmup_steps,
-            'learning_rate': learning_rate,
-            'gradient_accumulation_steps': gradient_acc,
-            'save_steps': save_steps,
-            'logging_steps': logging_steps,
-            'weight_decay': 0.01,
-            'per_device_train_batch_size': batch_size
-        }
-        
-        # Informations supplémentaires pour le logging
-        info = {
-            'dataset_size_gb': dataset_size_gb,
-            'total_batches': total_batches,
-            'estimated_hours': total_steps * hours_per_step
-        }
-        
-        # Message pour l'affichage
-        log_message = (
-            f"Configuration calculée pour {dataset_size_gb:.1f}GB:\n"
-            f"- Batches totaux: {total_batches:,}\n"
-            f"- Epochs: {num_epochs}\n"
-            f"- Steps effectifs: {total_steps:,}\n"
-            f"- Warmup steps: {warmup_steps:,} ({warmup_ratio*100:.1f}%)\n"
-            f"- Learning rate: {learning_rate}\n"
-            f"- Gradient accumulation: {gradient_acc}\n"
-            f"- Sauvegarde tous les {save_steps:,} steps (~{hours_between_saves:.1f}h)\n"
-            f"- Log tous les {logging_steps:,} steps\n"
-            f"- Temps d'entraînement estimé: {info['estimated_hours']:.1f}h"
-        )
-        
         return {
-            'training_args': training_args,
-            'info': info,
-            'log_message': log_message
+            'training_args': {
+                'num_train_epochs': num_epochs,
+                'max_steps': total_steps,
+                'learning_rate': learning_rate,
+                'warmup_steps': warmup_steps,
+                'save_steps': save_steps,
+                'logging_steps': logging_steps,
+                'gradient_accumulation_steps': gradient_acc,
+                'per_device_train_batch_size': batch_size
+            },
+            'info': {
+                'dataset_size_gb': dataset_size_gb,
+                'total_batches': total_batches,
+                'effective_batch_size': effective_batch,
+                'estimated_hours': total_steps * (2.5 / 3600)
+            },
+            'log_message': (
+                f"Configuration calculée pour {dataset_size_gb:.1f}GB:\n"
+                f"- Batches totaux: {total_batches:,}\n"
+                f"- Epochs: {num_epochs}\n"
+                f"- Steps maximum: {total_steps:,}\n"
+                f"- Learning rate: {learning_rate:.2e}\n"
+                f"- Gradient accumulation: {gradient_acc}\n"
+                f"- Batch size effectif: {effective_batch}\n"
+                f"- Warmup steps: {warmup_steps:,} ({warmup_ratio*100:.1f}%)\n"
+                f"- Sauvegarde tous les {save_steps:,} steps"
+            )
         }
 
     def start_training(self, output_dir: str, batch_size: int,

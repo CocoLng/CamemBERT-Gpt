@@ -7,6 +7,7 @@ from transformers import DataCollatorForLanguageModeling, RobertaTokenizerFast
 from datasets import Dataset
 from torch.utils.data import DataLoader
 import os
+import psutil
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -67,39 +68,54 @@ class DataLoader:
             raise
 
     def _initialize_data_collator(self) -> DataCollatorForLanguageModeling:
-        """Initialize MLM data collator with proper configuration"""
         return DataCollatorForLanguageModeling(
             tokenizer=self.tokenizer,
             mlm=True,
-            mlm_probability=self.mlm_probability
+            mlm_probability=0.15
         )
 
     def _prepare_dataset(self, dataset: Dataset) -> Dataset:
-        """Prepare dataset with proper text extraction"""
-        def extract_text(example):
-            # Pour mOSCAR
-            if isinstance(example.get('text', ''), list):
-                texts = [item['text'] if isinstance(item, dict) else str(item) 
-                        for item in example['text']]
-                return {'text': ' '.join(texts)}
-            # Pour OSCAR
-            elif 'content' in example:
-                return {'text': example['content']}
-            # Cas où text est déjà au bon format
-            elif isinstance(example.get('text', ''), str):
-                return {'text': example['text']}
-            return {'text': ''}
+        """
+        Prepare le dataset en extrayant et en nettoyant les données textuelles.
+        Gère les formats OSCAR ('content') et mOSCAR ('text').
+        """
+        def process_text(example):
+            # Extraction du texte selon le format
+            text = None
+            if 'text' in example:  # Format mOSCAR
+                text_field = example['text']
+                if isinstance(text_field, str):
+                    text = text_field
+                elif isinstance(text_field, list):
+                    # Concatène plusieurs segments de texte s'il y en a
+                    texts = []
+                    for item in text_field:
+                        if isinstance(item, str):
+                            texts.append(item)
+                        elif isinstance(item, dict) and 'text' in item:
+                            texts.append(item['text'])
+                    text = ' '.join(texts)
+            elif 'content' in example:  # Format OSCAR
+                text = example['content']
 
-        dataset = dataset.map(extract_text)
-        return dataset.select_columns(['text'])
+            # Vérifie si le texte est valide et suffisamment long
+            if not text or len(text) < 50:
+                return {'text': ''}
+
+            # Nettoyage basique : normalisation des espaces
+            text = ' '.join(text.split())
+
+            return {'text': text}
+
+        # Applique le traitement et filtre les textes vides
+        return dataset.map(process_text).filter(lambda x: x['text'] != '')
 
     def _tokenize_function(self, examples: Dict) -> Dict:
-        """Tokenize text using batch processing"""
         return self.tokenizer(
-            examples['text'],
+            examples["text"],
             truncation=True,
-            max_length=512,
             padding='max_length',
+            max_length=512,
             return_special_tokens_mask=True
         )
 
@@ -124,24 +140,29 @@ class DataLoader:
             raise
 
     def load_streaming_dataset(self, size_gb: float) -> str:
-        """Load and process streaming dataset"""
         try:
-            tokens_per_gb = int((1024 * 1024 * 1024) / 4)
+            # Calcul plus précis des tokens en tenant compte de la taille du vocabulaire
+            bytes_per_token = 4 * (1 + (self.tokenizer.vocab_size / 100000))
+            tokens_per_gb = int((1024 * 1024 * 1024) / bytes_per_token)
             self._dataset_size = int(size_gb * tokens_per_gb)
 
-            # Load base dataset
+            # Ajustement du buffer_size en fonction de la mémoire disponible
+            available_memory = psutil.virtual_memory().available
+            optimal_buffer = min(10000, int(available_memory / (bytes_per_token * 512)))
+            
+            # Load base dataset avec buffer optimisé
             self.dataset = load_dataset(
                 self.dataset_config.name,
                 name=self.dataset_config.subset,
                 split=self.dataset_config.split,
                 streaming=True
             )
-
+            
             if not self.dataset:
                 raise ValueError(f"Failed to load dataset {self.dataset_config.name}")
 
             # Process dataset
-            self.dataset = self.dataset.shuffle(buffer_size=10000)
+            self.dataset = self.dataset.shuffle(buffer_size=optimal_buffer)
             self.dataset = self._prepare_dataset(self.dataset)
             
             # Tokenize and limit size
@@ -313,15 +334,22 @@ class DataLoader:
         )
 
     def is_ready(self) -> bool:
-        """Check if dataset is loaded and ready"""
-        ready = (self.dataset is not None and 
-                self._dataset_size > 0 and 
-                next(iter(self.dataset.take(1)), None) is not None)
-        
-        if not ready:
-            self.logger.warning("Dataset non chargé ou vide")
+        if not self.dataset:
+            self.logger.warning("Dataset not loaded")
+            return False
             
-        return ready
+        if not self._dataset_size > 0:
+            self.logger.warning("Dataset size is 0")
+            return False
+            
+        # Vérification de l'état du dataset sans accéder aux données
+        try:
+            # Vérifie simplement que le dataset a les attributs nécessaires
+            _ = self.dataset.n_shards  # Vérification d'un attribut léger du dataset streaming
+            return True
+        except Exception as e:
+            self.logger.warning(f"Dataset not properly initialized: {e}")
+            return False
 
     @property
     def dataset_size(self) -> int:
