@@ -76,39 +76,34 @@ class DataLoader:
 
     def _prepare_dataset(self, dataset: Dataset) -> Dataset:
         """
-        Prepare le dataset en extrayant et en nettoyant les données textuelles.
+        Prepare le dataset en extrayant uniquement le texte.
         Gère les formats OSCAR ('content') et mOSCAR ('text').
         """
-        def process_text(example):
-            # Extraction du texte selon le format
+        def extract_text(example):
             text = None
-            if 'text' in example:  # Format mOSCAR
-                text_field = example['text']
-                if isinstance(text_field, str):
-                    text = text_field
-                elif isinstance(text_field, list):
-                    # Concatène plusieurs segments de texte s'il y en a
+            
+            # Format mOSCAR
+            if 'text' in example:
+                if isinstance(example['text'], list):  # mOSCAR peut avoir une liste
                     texts = []
-                    for item in text_field:
-                        if isinstance(item, str):
-                            texts.append(item)
-                        elif isinstance(item, dict) and 'text' in item:
+                    for item in example['text']:
+                        if isinstance(item, dict) and 'text' in item:
                             texts.append(item['text'])
                     text = ' '.join(texts)
-            elif 'content' in example:  # Format OSCAR
+                elif isinstance(example['text'], str):
+                    text = example['text']
+            # Format OSCAR
+            elif 'content' in example:
                 text = example['content']
-
-            # Vérifie si le texte est valide et suffisamment long
-            if not text or len(text) < 50:
+                
+            if not text or len(text.strip()) < 50:  # Validation minimale
                 return {'text': ''}
+                
+            return {'text': text.strip()}
 
-            # Nettoyage basique : normalisation des espaces
-            text = ' '.join(text.split())
-
-            return {'text': text}
-
-        # Applique le traitement et filtre les textes vides
-        return dataset.map(process_text).filter(lambda x: x['text'] != '')
+        # Application du traitement et filtrage des textes vides
+        processed = dataset.map(extract_text)
+        return processed.filter(lambda x: x['text'] != '').select_columns(['text'])
 
     def _tokenize_function(self, examples: Dict) -> Dict:
         return self.tokenizer(
