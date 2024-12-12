@@ -1,8 +1,6 @@
 import logging
 from dataclasses import dataclass
-from typing import Optional
-import torch
-from transformers import RobertaConfig, RobertaForMaskedLM, RobertaTokenizerFast
+from transformers import RobertaConfig, RobertaTokenizerFast
 
 
 @dataclass
@@ -34,7 +32,6 @@ class ModelConfig:
 
     def initialize_full_config(
         self,
-        vocab_size: int,
         hidden_size: int,
         num_attention_heads: int,
         num_hidden_layers: int,
@@ -42,7 +39,7 @@ class ModelConfig:
         hidden_dropout_prob: float,
         attention_probs_dropout_prob: float,
         run_handler = None
-    ) -> str:
+    ) -> tuple[str, str]:
         try:
             # Initialize base tokenizer with explicit error handling
             try:
@@ -51,25 +48,28 @@ class ModelConfig:
                     if self.base_tokenizer is None:
                         raise ValueError("Failed to initialize RoBERTa tokenizer")
             except Exception as e:
-                return f"❌ Erreur d'initialisation du tokenizer: {str(e)}"
+                return f"❌ Erreur d'initialisation du tokenizer: {str(e)}", ""
 
+            # Get the original vocabulary size
             original_vocab_size = len(self.base_tokenizer)
+            # Use the model_args vocab_size
+            vocab_size = self.model_args.vocab_size
 
             # Validation des paramètres
             if hidden_size % num_attention_heads != 0:
-                return "❌ Erreur: La dimension des embeddings doit être divisible par le nombre de têtes d'attention"
+                return "❌ Erreur: La dimension des embeddings doit être divisible par le nombre de têtes d'attention", ""
                 
             if hidden_size <= 0 or num_attention_heads <= 0 or num_hidden_layers <= 0:
-                return "❌ Erreur: Les dimensions doivent être strictement positives"
+                return "❌ Erreur: Les dimensions doivent être strictement positives", ""
                 
             if vocab_size < original_vocab_size:
-                return f"❌ Erreur: La taille du vocabulaire doit être >= {original_vocab_size}"
+                return f"❌ Erreur: La taille du vocabulaire doit être >= {original_vocab_size}", ""
                 
             if intermediate_size < hidden_size:
-                return "❌ Erreur: La taille intermédiaire doit être supérieure à la dimension des embeddings"
+                return "❌ Erreur: La taille intermédiaire doit être supérieure à la dimension des embeddings", ""
                 
             if not (0 <= hidden_dropout_prob <= 1 and 0 <= attention_probs_dropout_prob <= 1):
-                return "❌ Erreur: Les probabilités de dropout doivent être entre 0 et 1"
+                return "❌ Erreur: Les probabilités de dropout doivent être entre 0 et 1", ""
 
             # Create configuration with validated parameters
             config_params = {
@@ -86,33 +86,39 @@ class ModelConfig:
             }
             
             self._create_config(**config_params)
-            
-            # Initialize model with proper embedding handling
-            model = self._initialize_model_with_vocab()
-            
+
             # Initialize training configuration if data is ready
             if run_handler is not None and run_handler.data_loader is not None:
                 if not run_handler.data_loader.is_ready():
-                    return "❌ Erreur: Veuillez d'abord charger le dataset"
+                    return "❌ Erreur: Veuillez d'abord charger le dataset", ""
                     
                 from .train import TrainingConfig
                 run_handler.training_config = TrainingConfig(self, run_handler.data_loader)
-                self.logger.info("Configuration d'entraînement initialisée avec succès")
+                
+                # Calculer automatiquement les paramètres optimaux
+                training_params = run_handler.training_config._calculate_training_parameters()
+                
+                # Préparer les messages de statut
+                model_status = (
+                    "✅ Configuration du modèle initialisée avec succès!\n\n"
+                    f"Paramètres du modèle:\n"
+                    f"- Architecture: {num_hidden_layers} couches, {num_attention_heads} têtes d'attention\n"
+                    f"- Dimensions: {hidden_size} embeddings, {intermediate_size} intermédiaire\n"
+                    f"- Vocabulaire: {vocab_size} tokens (original: {original_vocab_size})\n"
+                    f"- Regularisation: {hidden_dropout_prob} dropout, {attention_probs_dropout_prob} attention dropout"
+                )
 
-            status = (
-                "✅ Configuration du modèle initialisée avec succès!\n\n"
-                "Paramètres choisis:\n"
-                f"- Architecture: {num_hidden_layers} couches, {num_attention_heads} têtes d'attention\n"
-                f"- Dimensions: {hidden_size} embeddings, {intermediate_size} intermédiaire\n"
-                f"- Vocabulaire: {vocab_size} tokens (original: {original_vocab_size})\n"
-                f"- Regularisation: {hidden_dropout_prob} dropout, {attention_probs_dropout_prob} attention dropout"
-            )
-
-            return status
+                return model_status, training_params['log_message']
+            else:
+                return (
+                    "✅ Configuration du modèle initialisée avec succès, "
+                    "mais pas de dataset chargé pour l'entraînement",
+                    ""
+                )
                 
         except Exception as e:
             self.logger.error(f"Erreur lors de l'initialisation: {e}")
-            return f"❌ Erreur lors de l'initialisation: {str(e)}"
+            return f"❌ Erreur lors de l'initialisation: {str(e)}", ""
 
     def _create_config(self, **kwargs) -> None:
         """Crée la configuration RoBERTa avec les paramètres fournis"""
@@ -144,66 +150,4 @@ class ModelConfig:
             self.logger.error(f"Erreur création configuration: {e}")
             raise
 
-    def _initialize_model_with_vocab(self) -> RobertaForMaskedLM:
-        try:
-            # Détection de l'environnement
-            cuda_available = torch.cuda.is_available()
-            dtype = torch.float16 if cuda_available else torch.float32
-            
-            # Initialisation du modèle avec les paramètres appropriés
-            model = RobertaForMaskedLM(self.config)
-            
-            with torch.no_grad():
-                # Chargement du modèle de base
-                base_model = RobertaForMaskedLM.from_pretrained(
-                    "roberta-base",
-                    torch_dtype=dtype,
-                    low_cpu_mem_usage=True
-                )
-                
-                # Récupération des embeddings originaux
-                original_embeddings = base_model.get_input_embeddings().weight.data
-                
-                # Si les dimensions sont différentes, on fait un redimensionnement
-                if original_embeddings.size(1) != self.config.hidden_size:
-                    # Redimensionnement linéaire des embeddings pour correspondre à la nouvelle dimension
-                    original_embeddings = torch.nn.functional.interpolate(
-                        original_embeddings.unsqueeze(0),  # Ajoute une dimension pour le batch
-                        size=(self.config.hidden_size,),
-                        mode='linear'
-                    ).squeeze(0)  # Retire la dimension de batch
-                
-                # Initialisation des embeddings
-                new_embeddings = model.get_input_embeddings()
-                new_embeddings.weight.data[:len(self.base_tokenizer)] = original_embeddings
-                
-                if self.config.vocab_size > len(self.base_tokenizer):
-                    size = (self.config.vocab_size - len(self.base_tokenizer), self.config.hidden_size)
-                    
-                    # Calcul des statistiques pour l'initialisation
-                    token_norms = torch.norm(original_embeddings, dim=1)
-                    mean = token_norms.mean()
-                    std = token_norms.std()
-                    
-                    # Initialisation des nouveaux tokens
-                    new_tokens = torch.normal(mean=mean, std=std, size=size, dtype=dtype)
-                    
-                    # Mise à jour des embeddings
-                    new_embeddings.weight.data[len(self.base_tokenizer):] = new_tokens
-                    model.get_output_embeddings().weight.data[:len(self.base_tokenizer)] = original_embeddings
-                    model.get_output_embeddings().weight.data[len(self.base_tokenizer):] = new_tokens
-                
-                # Nettoyage
-                del base_model
-                if cuda_available:
-                    torch.cuda.empty_cache()
-            
-            return model
-            
-        except Exception as e:
-            self.logger.error(f"Error initializing model with vocabulary: {e}")
-            raise
-
-    def get_config(self) -> Optional[RobertaConfig]:
-        """Récupère la configuration actuelle"""
-        return self.config
+    

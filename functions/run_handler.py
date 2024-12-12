@@ -212,13 +212,6 @@ class Run_Handler:
                             value="camembert-training", 
                             label="Dossier de Sortie"
                         )
-                        batch_size = gr.Slider(
-                            minimum=16,
-                            maximum=80,
-                            value=80,
-                            step=8,
-                            label="Taille des Batchs",
-                        )
                         use_cuda = gr.Checkbox(
                             value=True,
                             label="Utiliser CUDA (si disponible)",
@@ -228,13 +221,6 @@ class Run_Handler:
                             value=True,
                             label="Utiliser Mixed Precision (FP16)",
                             interactive=True,
-                        )
-                        num_workers = gr.Slider(
-                            minimum=0,
-                            maximum=8,
-                            value=4,
-                            step=1,
-                            label="Nombre de Workers pour DataLoader",
                         )
 
                     with gr.Column():
@@ -248,7 +234,6 @@ class Run_Handler:
                             label="Nom du Projet W&B"
                         )
 
-                # Nouvelle section pour les checkpoints
                 gr.Markdown("### Gestion des Checkpoints")
                 with gr.Row():
                     with gr.Column():
@@ -278,16 +263,6 @@ class Run_Handler:
                         label="Statut de l'Entraînement", 
                         interactive=False
                     )
-
-                # Event handlers
-                def update_training_config(batch_size):
-                    if hasattr(self, 'training_config') and self.training_config and self.data_loader.is_ready():
-                        try:
-                            params = self.training_config._calculate_training_parameters(batch_size)
-                            return params['log_message']
-                        except Exception as e:
-                            return f"Erreur de calcul des paramètres: {str(e)}"
-                    return "Veuillez d'abord charger le dataset et initialiser le modèle"
 
             # Dans la méthode create_interface() :
             with gr.Tab("4. Test du Modèle"):
@@ -531,10 +506,16 @@ class Run_Handler:
                 )
 
             init_model_btn.click(
-            fn=lambda *args: (
-                self.model_config.initialize_full_config(*args, run_handler=self),
-                update_training_config(batch_size.value)  # Ajout de cette ligne
-            ),
+            fn=lambda vocab_size, hidden_size, num_heads, num_layers, inter_size, hidden_dropout, attn_dropout: 
+                self.model_config.initialize_full_config(
+                    hidden_size=hidden_size,
+                    num_attention_heads=num_heads,
+                    num_hidden_layers=num_layers,
+                    intermediate_size=inter_size,
+                    hidden_dropout_prob=hidden_dropout,
+                    attention_probs_dropout_prob=attn_dropout,
+                    run_handler=self
+                ),
             inputs=[
                 vocab_size,
                 hidden_size,
@@ -544,16 +525,8 @@ class Run_Handler:
                 hidden_dropout_prob,
                 attention_probs_dropout_prob,
             ],
-            outputs=[model_status, training_config_display],  # Ajout de training_config_display
+            outputs=[model_status, training_config_display],
         )
-
-            # Event handlers pour les checkpoints
-            batch_size.change(
-            fn=update_training_config,
-            inputs=[batch_size],
-            outputs=[training_config_display]
-        )
-
             # Event handlers pour les checkpoints
             refresh_checkpoints.click(
                 fn=self._get_available_checkpoints,
@@ -573,11 +546,9 @@ class Run_Handler:
                 else "❌ Configuration non initialisée",
                 inputs=[
                     output_dir,
-                    batch_size,
                     wandb_project,
                     use_cuda,
-                    fp16_training,
-                    num_workers
+                    fp16_training
                 ],
                 outputs=[training_status],
             )

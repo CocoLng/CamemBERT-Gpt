@@ -76,34 +76,15 @@ class DataLoader:
 
     def _prepare_dataset(self, dataset: Dataset) -> Dataset:
         """
-        Prepare le dataset en extrayant uniquement le texte.
-        Gère les formats OSCAR ('content') et mOSCAR ('text').
+        Prepare dataset with proper text extraction.
         """
-        def extract_text(example):
-            text = None
-            
-            # Format mOSCAR
-            if 'text' in example:
-                if isinstance(example['text'], list):  # mOSCAR peut avoir une liste
-                    texts = []
-                    for item in example['text']:
-                        if isinstance(item, dict) and 'text' in item:
-                            texts.append(item['text'])
-                    text = ' '.join(texts)
-                elif isinstance(example['text'], str):
-                    text = example['text']
-            # Format OSCAR
-            elif 'content' in example:
-                text = example['content']
-                
-            if not text or len(text.strip()) < 50:  # Validation minimale
-                return {'text': ''}
-                
-            return {'text': text.strip()}
-
-        # Application du traitement et filtrage des textes vides
-        processed = dataset.map(extract_text)
-        return processed.filter(lambda x: x['text'] != '').select_columns(['text'])
+        try:
+            # Apply the transformation and keep only the text column
+            dataset = dataset.map(extract_text)
+            return dataset.select_columns(['text'])
+        except Exception as e:
+            self.logger.error(f"Error preparing dataset: {e}")
+            raise
 
     def _tokenize_function(self, examples: Dict) -> Dict:
         return self.tokenizer(
@@ -113,26 +94,6 @@ class DataLoader:
             max_length=512,
             return_special_tokens_mask=True
         )
-
-    def get_train_dataloader(self) -> DataLoader:
-        """Create optimized streaming dataloader with proper batching"""
-        try:
-            if not self.dataset:
-                raise ValueError("Dataset not initialized")
-                
-            return DataLoader(
-                self.dataset,
-                batch_size=self.args.per_device_train_batch_size,
-                collate_fn=self.data_collator,
-                num_workers=4,
-                pin_memory=torch.cuda.is_available(),
-                prefetch_factor=2,
-                drop_last=True  # Important pour éviter les problèmes de batch incomplet
-            )
-                
-        except Exception as e:
-            self.logger.error(f"Error creating dataloader: {e}")
-            raise
 
     def load_streaming_dataset(self, size_gb: float) -> str:
         try:
@@ -357,3 +318,18 @@ class DataLoader:
                 f"Size: {size_gb} GB, "
                 f"Effective masking: {stats.average_ratio:.2%} "
                 f"(target: {self.mlm_probability:.1%})")
+    
+def extract_text(example):
+    """Extract text field from dataset examples."""
+    # For mOSCAR
+    if 'text' in example and isinstance(example['text'], list):
+        texts = [item['text'] for item in example['text']]
+        return {'text': ' '.join(texts)}
+    # For OSCAR
+    elif 'content' in example:
+        return {'text': example['content']}
+    # Case where text is already in the correct format
+    elif 'text' in example and isinstance(example['text'], str):
+        return {'text': example['text']}
+    else:
+        return {'text': ''}

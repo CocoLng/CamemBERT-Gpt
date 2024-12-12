@@ -34,37 +34,7 @@ class CustomTrainer(Trainer):
         # Save initial configuration
         self._save_model_info(self.base_dir)
 
-    def get_train_dataloader(self):
-        """Create streaming dataloader with proper handling"""
-        try:
-            if not self.data_loader or not self.data_loader.dataset:
-                raise ValueError("Dataset stream not configured")
-            
-            self.logger.info("Setting up training dataloader...")
-            
-            # Debug first batch
-            sample_iter = iter(self.data_loader.dataset)
-            first_batch = next(sample_iter)
-            self.logger.info(f"First batch keys: {first_batch.keys()}")
-            
-            dataloader = DataLoader(
-                self.data_loader.dataset,
-                batch_size=self.args.per_device_train_batch_size,
-                collate_fn=self.data_loader.data_collator,
-                num_workers=self.args.dataloader_num_workers,
-                pin_memory=True if torch.cuda.is_available() else False
-            )
-            
-            # Test first batch from dataloader
-            test_iter = iter(dataloader)
-            test_batch = next(test_iter)
-            self.logger.info(f"Test batch keys after collate: {test_batch.keys()}")
-            
-            return dataloader
-            
-        except Exception as e:
-            self.logger.error(f"Error setting up dataloader: {e}")
-            raise
+    
 
     def _save_model_info(self, directory: str):
         """Save comprehensive model information"""
@@ -388,34 +358,39 @@ class TrainingConfig:
         except Exception as e:
             self.logger.error(f"Setup verification failed: {e}")
             raise
-
-    def _verify_masking_stats(self, stats) -> bool:
-        """Verify masking statistics are within acceptable range"""
-        if not stats:
-            return False
-            
-        tolerance = 0.02  # 2% tolerance
-        expected = self.data_loader.mlm_probability
-        actual = stats['current_masking_ratio']
-        
-        within_tolerance = abs(actual - expected) <= tolerance
-        
-        if not within_tolerance:
-            self.logger.warning(
-                f"Masking ratio {actual:.2%} outside tolerance range "
-                f"[{expected-tolerance:.2%}, {expected+tolerance:.2%}]"
-            )
-            
-        return within_tolerance
     
-    def _calculate_training_parameters(self, batch_size: int) -> dict:
+    def _calculate_training_parameters(self) -> dict:
         """
         Calculate training parameters for OSCAR/mOSCAR with adaptive stopping criteria
+        and hardware-specific optimizations
         """
         if not self.data_loader or not self.data_loader.dataset_size:
             raise ValueError("Dataset non initialisé")
 
-        # Calculs de base avec meilleure précision
+        # Détection et configuration hardware
+        cuda_available = torch.cuda.is_available()
+        if cuda_available:
+            gpu_info = torch.cuda.get_device_properties(0)
+            vram_gb = gpu_info.total_memory / (1024**3)
+            
+            # Utilisation de 90% de la VRAM comme demandé
+            max_vram_usage = vram_gb * 0.9
+            
+            # Ajustement du batch size pour GPU
+            # On sait qu'un batch_size de 72 fonctionne bien sur les GPU modernes
+            if vram_gb >= 48:  # Pour les GPU haute capacité (A100 etc.)
+                batch_size = 75
+            else:
+                # Pour les GPU plus petits, en gardant un minimum raisonnable
+                batch_size = max(32, int((max_vram_usage * 72) / 24))
+        else:
+            # Configuration locale limitée à 5GB
+            batch_size = int(5 * 1024 / 8)
+            optimal_workers = 2
+
+        logging.info(f"Batch size: {batch_size}")
+
+        # Le reste de la fonction reste identique, en utilisant la variable batch_size calculée
         tokens_per_batch = batch_size * 512
         total_batches = self.data_loader.dataset_size // tokens_per_batch
         dataset_size_gb = self.data_loader.dataset_size * 4 / (1024**3)
@@ -424,14 +399,19 @@ class TrainingConfig:
         hidden_size = self.model_config.config.hidden_size
         num_layers = self.model_config.config.num_hidden_layers
         
-        # Calcul du gradient accumulation selon la taille des données
-        if dataset_size_gb < 10:
-            gradient_acc = 1
-        elif dataset_size_gb < 50:
-            gradient_acc = min(2, batch_size // 8)
+        # Calcul du gradient accumulation selon la taille des données et hardware
+        if cuda_available:
+            # Sur GPU, on adapte selon la VRAM disponible
+            if dataset_size_gb < 10:
+                gradient_acc = 1
+            elif dataset_size_gb < 50:
+                gradient_acc = min(2, batch_size // 16)  # Plus agressif sur GPU
+            else:
+                gradient_acc = min(4, batch_size // 8)
         else:
-            gradient_acc = min(4, batch_size // 4)
-            
+            # En local, accumulation minimale
+            gradient_acc = 1
+                
         # Calcul de la taille effective du batch
         effective_batch = batch_size * gradient_acc
         
@@ -442,14 +422,14 @@ class TrainingConfig:
         
         if dataset_size_gb < 10:
             learning_rate = base_lr * architecture_scale * batch_scale
-            max_steps = 100000  # Critère d'arrêt maximum
+            max_steps = 100000
         elif dataset_size_gb < 50:
             learning_rate = (2.5 * base_lr) * architecture_scale * batch_scale
             max_steps = 200000
         else:
             learning_rate = (4 * base_lr) * architecture_scale * batch_scale
             max_steps = 300000
-            
+                
         # Calcul du nombre optimal d'epochs et des steps
         tokens_per_epoch = self.data_loader.dataset_size
         updates_per_epoch = tokens_per_epoch // (effective_batch * 512)
@@ -476,46 +456,50 @@ class TrainingConfig:
         save_steps = max(save_steps, total_steps // 50)  # Maximum 50 sauvegardes
         logging_steps = save_steps // 5
 
+        hardware_info = "🖥️ CPU (Test Local)" if not cuda_available else f"🚀 GPU ({gpu_info.name}, {vram_gb:.1f}GB VRAM)"
+
         return {
-            'training_args': {
-                'num_train_epochs': num_epochs,
-                'max_steps': total_steps,
-                'learning_rate': learning_rate,
-                'warmup_steps': warmup_steps,
-                'save_steps': save_steps,
-                'logging_steps': logging_steps,
-                'gradient_accumulation_steps': gradient_acc,
-                'per_device_train_batch_size': batch_size
-            },
-            'info': {
-                'dataset_size_gb': dataset_size_gb,
-                'total_batches': total_batches,
-                'effective_batch_size': effective_batch,
-                'estimated_hours': total_steps * (2.5 / 3600)
-            },
-            'log_message': (
-                f"Configuration calculée pour {dataset_size_gb:.1f}GB:\n"
+        'training_args': {
+            'num_train_epochs': num_epochs,
+            'max_steps': total_steps,
+            'learning_rate': learning_rate,
+            'warmup_steps': warmup_steps,
+            'save_steps': save_steps,
+            'logging_steps': logging_steps,
+            'gradient_accumulation_steps': gradient_acc,
+            'per_device_train_batch_size': batch_size,
+            'dataloader_num_workers': optimal_workers,
+            # Remove dataloader_pin_memory from here as it will be set in start_training
+        },
+        'info': {
+            'dataset_size_gb': dataset_size_gb,
+            'total_batches': total_batches,
+            'effective_batch_size': effective_batch,
+            'estimated_hours': total_steps * (2.5 / 3600),
+            'hardware_setup': hardware_info
+        },
+        'log_message': (
+                f"Configuration calculée pour {dataset_size_gb:.1f}GB sur {hardware_info}:\n"
                 f"- Batches totaux: {total_batches:,}\n"
                 f"- Epochs: {num_epochs}\n"
                 f"- Steps maximum: {total_steps:,}\n"
                 f"- Learning rate: {learning_rate:.2e}\n"
                 f"- Gradient accumulation: {gradient_acc}\n"
                 f"- Batch size effectif: {effective_batch}\n"
+                f"- Nombre de workers: {optimal_workers}\n"
                 f"- Warmup steps: {warmup_steps:,} ({warmup_ratio*100:.1f}%)\n"
                 f"- Sauvegarde tous les {save_steps:,} steps"
             )
         }
 
-    def start_training(self, output_dir: str, batch_size: int,
-                  wandb_project: str, use_cuda: bool, 
-                  fp16_training: bool, num_workers: int) -> str:
+    def start_training(self, output_dir: str, wandb_project: str, use_cuda: bool, fp16_training: bool) -> str:
         try:
             if not self.model:
                 return "❌ Model not initialized"
 
-            # Calcul des paramètres
-            params = self._calculate_training_parameters(batch_size)
-            training_args = params['training_args']
+            # Get training parameters
+            training_params = self._calculate_training_parameters()
+            training_args = training_params['training_args']
             
             cuda_available = torch.cuda.is_available() and use_cuda
             
@@ -528,28 +512,25 @@ class TrainingConfig:
                     dir=self.run_dir,
                     config={
                         **training_args,
-                        **params['info'],
+                        **training_params['info'],
                         'model_config': self.model.config.to_dict()
                     }
                 )
 
             # Create training arguments
-            training_args = TrainingArguments(
+            args = TrainingArguments(
                 output_dir=self.run_dir,
                 **training_args,
                 fp16=cuda_available and fp16_training,
-                dataloader_num_workers=num_workers if cuda_available else 0,
-                dataloader_pin_memory=cuda_available,
+                dataloader_pin_memory=cuda_available,  # Set this only here
                 report_to="wandb" if cuda_available else "none",
             )
 
             self.logger.info("Setting up trainer...")
-            self.setup_trainer(training_args)
+            self.setup_trainer(args)
             
             self.logger.info("Starting training...")
             self.trainer.train()
-            
-            self._save_final_model()
             
             return "✅ Training completed successfully!"
 
