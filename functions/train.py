@@ -361,105 +361,81 @@ class TrainingConfig:
     
     def _calculate_training_parameters(self) -> dict:
         """
-        Calculate training parameters for OSCAR/mOSCAR with adaptive stopping criteria
-        and hardware-specific optimizations
+        Calculate optimized training parameters for OSCAR/mOSCAR with adaptive configurations.
+        Key features:
+        - Fixed optimal batch size with gradient accumulation for effective batch size control
+        - RoBERTa-style learning rate schedule with proper warmup
+        - Dynamic steps and epochs based on dataset size
+        - Optimized cosine schedule with restarts
         """
         if not self.data_loader or not self.data_loader.dataset_size:
             raise ValueError("Dataset non initialisé")
 
-        # Détection et configuration hardware
+        # Fixed optimal batch size as per RoBERTa recommendations
         cuda_available = torch.cuda.is_available()
-        if cuda_available:
-            gpu_info = torch.cuda.get_device_properties(0)
-            vram_gb = gpu_info.total_memory / (1024**3)
-            
-            # Utilisation de 90% de la VRAM comme demandé
-            max_vram_usage = vram_gb * 0.9
-            
-            # Ajustement du batch size pour GPU
-            # On sait qu'un batch_size de 72 fonctionne bien sur les GPU modernes
-            if vram_gb >= 48:  # Pour les GPU haute capacité (A100 etc.)
-                batch_size = 75
-            else:
-                # Pour les GPU plus petits, en gardant un minimum raisonnable
-                batch_size = max(32, int((max_vram_usage * 72) / 24))
-        else:
-            # Configuration locale limitée à 5GB
-            batch_size = int(5 * 1024 / 8)
-            optimal_workers = 2
+        base_batch_size = 75 if cuda_available else 16
+        optimal_workers = 4 if cuda_available else 2
 
-        logging.info(f"Batch size: {batch_size}")
-
-        # Le reste de la fonction reste identique, en utilisant la variable batch_size calculée
-        tokens_per_batch = batch_size * 512
-        total_batches = self.data_loader.dataset_size // tokens_per_batch
+        # Dataset Size Analysis
         dataset_size_gb = self.data_loader.dataset_size * 4 / (1024**3)
         
-        # Récupération des paramètres du modèle
-        hidden_size = self.model_config.config.hidden_size
-        num_layers = self.model_config.config.num_hidden_layers
+        # Adaptive Gradient Accumulation for effective batch size control
+        # Smaller datasets need more accumulation for better convergence
+        if dataset_size_gb < 5:
+            gradient_acc = 8  # Effective batch size: 600
+        elif dataset_size_gb < 20:
+            gradient_acc = 12  # Effective batch size: 900
+        else:
+            gradient_acc = 16  # Effective batch size: 1200
+            
+        # Calculate effective batch size
+        effective_batch_size = base_batch_size * gradient_acc
         
-        # Calcul du gradient accumulation selon la taille des données et hardware
+        # RoBERTa-style Learning Rate Configuration
+        base_lr = 6e-4  # RoBERTa base learning rate
+        # Scale learning rate based on effective batch size
+        batch_scale = (effective_batch_size / 256) ** 0.5
+        learning_rate = base_lr * batch_scale
+        
+        # Calculate total batches and steps
+        tokens_per_batch = base_batch_size * 512
+        total_batches = self.data_loader.dataset_size // tokens_per_batch
+        
+        # Adaptive number of epochs based on dataset size
+        if dataset_size_gb < 5:
+            num_epochs = 5  # More epochs for smaller datasets
+        elif dataset_size_gb < 20:
+            num_epochs = 3
+        else:
+            num_epochs = 2  # Fewer epochs for larger datasets
+            
+        # Calculate total steps based on real data size
+        updates_per_epoch = total_batches // gradient_acc
+        total_steps = updates_per_epoch * num_epochs
+        
+        # RoBERTa standard 6% warmup
+        warmup_steps = int(0.06 * total_steps)
+        
+        # Adaptive save frequency based on training progress
+        updates_per_hour = 3600 / (2.5 * (effective_batch_size / 256))
+        save_interval_hours = 1.0 if dataset_size_gb < 20 else 2.0
+        save_steps = max(100, int(updates_per_hour * save_interval_hours))
+        
+        # Ensure reasonable number of saves (between 20 and 100 saves total)
+        save_steps = min(save_steps, total_steps // 20)
+        save_steps = max(save_steps, total_steps // 100)
+        
+        # More frequent logging for better monitoring
+        logging_steps = save_steps // 4
+
+        # Hardware info string
         if cuda_available:
-            # Sur GPU, on adapte selon la VRAM disponible
-            if dataset_size_gb < 10:
-                gradient_acc = 1
-            elif dataset_size_gb < 50:
-                gradient_acc = min(2, batch_size // 16)  # Plus agressif sur GPU
-            else:
-                gradient_acc = min(4, batch_size // 8)
+            gpu_info = torch.cuda.get_device_properties(0)
+            hardware_info = f"🚀 GPU ({gpu_info.name}, {gpu_info.total_memory / (1024**3):.1f}GB VRAM)"
         else:
-            # En local, accumulation minimale
-            gradient_acc = 1
-                
-        # Calcul de la taille effective du batch
-        effective_batch = batch_size * gradient_acc
-        
-        # Learning rate adaptatif basé sur l'architecture et la taille du batch
-        base_lr = 1e-5
-        architecture_scale = (768 / hidden_size) * (12 / num_layers) ** 0.5
-        batch_scale = (effective_batch / 256) ** 0.5
-        
-        if dataset_size_gb < 10:
-            learning_rate = base_lr * architecture_scale * batch_scale
-            max_steps = 100000
-        elif dataset_size_gb < 50:
-            learning_rate = (2.5 * base_lr) * architecture_scale * batch_scale
-            max_steps = 200000
-        else:
-            learning_rate = (4 * base_lr) * architecture_scale * batch_scale
-            max_steps = 300000
-                
-        # Calcul du nombre optimal d'epochs et des steps
-        tokens_per_epoch = self.data_loader.dataset_size
-        updates_per_epoch = tokens_per_epoch // (effective_batch * 512)
-        
-        if dataset_size_gb < 10:
-            min_updates = 10000
-            num_epochs = min(5, max(3, min_updates // updates_per_epoch))
-        elif dataset_size_gb < 50:
-            min_updates = 25000
-            num_epochs = min(3, max(2, min_updates // updates_per_epoch))
-        else:
-            min_updates = 50000
-            num_epochs = min(2, max(1, min_updates // updates_per_epoch))
-        
-        # Calcul des steps avec critères d'arrêt
-        total_steps = min(max_steps, updates_per_epoch * num_epochs)
-        warmup_ratio = min(0.1, 0.06 * (effective_batch / 256))
-        warmup_steps = int(total_steps * warmup_ratio)
-        
-        # Optimisation de la fréquence de sauvegarde
-        updates_per_hour = 3600 / (2.5 * (effective_batch / 256))
-        min_save_frequency = max(0.5, min(2.0, dataset_size_gb / 20))
-        save_steps = max(100, int(updates_per_hour * min_save_frequency))
-        save_steps = max(save_steps, total_steps // 50)  # Maximum 50 sauvegardes
-        logging_steps = save_steps // 5
+            hardware_info = "🖥️ CPU (Test Local)"
 
-        hardware_info = "🖥️ CPU (Test Local)" if not cuda_available else f"🚀 GPU ({gpu_info.name}, {vram_gb:.1f}GB VRAM)"
-
-        return {
-        'training_args': {
+        training_args = {
             'num_train_epochs': num_epochs,
             'max_steps': total_steps,
             'learning_rate': learning_rate,
@@ -467,28 +443,36 @@ class TrainingConfig:
             'save_steps': save_steps,
             'logging_steps': logging_steps,
             'gradient_accumulation_steps': gradient_acc,
-            'per_device_train_batch_size': batch_size,
+            'per_device_train_batch_size': base_batch_size,
             'dataloader_num_workers': optimal_workers,
-            # Remove dataloader_pin_memory from here as it will be set in start_training
-        },
-        'info': {
-            'dataset_size_gb': dataset_size_gb,
-            'total_batches': total_batches,
-            'effective_batch_size': effective_batch,
-            'estimated_hours': total_steps * (2.5 / 3600),
-            'hardware_setup': hardware_info
-        },
-        'log_message': (
-                f"Configuration calculée pour {dataset_size_gb:.1f}GB sur {hardware_info}:\n"
+            'weight_decay': 0.01,  # RoBERTa paper value
+            'adam_beta1': 0.9,
+            'adam_beta2': 0.98,  # RoBERTa paper value
+            'max_grad_norm': 1.0,
+            'lr_scheduler_type': "cosine_with_restarts",  # Cosine schedule with restarts
+        }
+
+        return {
+            'training_args': training_args,
+            'info': {
+                'dataset_size_gb': dataset_size_gb,
+                'total_batches': total_batches,
+                'effective_batch_size': effective_batch_size,
+                'estimated_hours': total_steps * (2.5 / 3600),
+                'hardware_setup': hardware_info
+            },
+            'log_message': (
+                f"Configuration optimisée pour {dataset_size_gb:.1f}GB sur {hardware_info}:\n"
                 f"- Batches totaux: {total_batches:,}\n"
                 f"- Epochs: {num_epochs}\n"
                 f"- Steps maximum: {total_steps:,}\n"
                 f"- Learning rate: {learning_rate:.2e}\n"
                 f"- Gradient accumulation: {gradient_acc}\n"
-                f"- Batch size effectif: {effective_batch}\n"
+                f"- Batch size: {base_batch_size} (effectif: {effective_batch_size})\n"
                 f"- Nombre de workers: {optimal_workers}\n"
-                f"- Warmup steps: {warmup_steps:,} ({warmup_ratio*100:.1f}%)\n"
-                f"- Sauvegarde tous les {save_steps:,} steps"
+                f"- Warmup steps: {warmup_steps:,} ({(warmup_steps/total_steps)*100:.1f}%)\n"
+                f"- Sauvegarde tous les {save_steps:,} steps (~{save_interval_hours:.1f}h)\n"
+                f"- Schedule: Cosine avec restarts"
             )
         }
 
