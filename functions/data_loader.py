@@ -178,6 +178,9 @@ class DataLoader:
             # Verify initial samples
             masking_stats = self._verify_streaming_masking()
             
+            # Log custom message
+            self.logger.info(f"Dataset {self.dataset_config.name} loaded successfully with size {size_gb} GB")
+            
             return self._format_loading_status(size_gb, masking_stats, optimal_buffer)
         
         except Exception as e:
@@ -426,11 +429,11 @@ class DataLoader:
         if not self.dataset:
             self.logger.warning("Dataset not loaded")
             return False
-            
+                
         if not self._dataset_size > 0:
             self.logger.warning("Dataset size is 0")
             return False
-            
+                
         try:
             # Verify streaming functionality
             next(iter(self.dataset))

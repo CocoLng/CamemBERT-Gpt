@@ -5,7 +5,6 @@ import gradio as gr
 from typing import List
 
 from transformers import RobertaForMaskedLM, RobertaTokenizerFast
-import wandb
 
 from .data_loader import DataLoader, DatasetConfig
 from .model_config import ModelConfig
@@ -113,18 +112,21 @@ class Run_Handler:
                 }
 
                 def initialize_and_load_dataset(choice: str, size: float, prob: float) -> str:
+                    """Initialise le DataLoader avec la configuration du dataset spécifiée par l'utilisateur"""
                     try:
                         dataset_name = dataset_mapping.get(choice)
                         if not dataset_name:
                             return "❌ Dataset non valide"
                         
-                        # Utiliser le bon code langue selon le dataset
                         subset = "fra_Latn" if choice == "mOSCAR (default)" else "fr"
                         
+                        # Met à jour self.data_loader avec les paramètres sélectionnés
                         self.data_loader = DataLoader(
                             dataset_config=DatasetConfig(
                                 name=dataset_name,
-                                subset=subset
+                                subset=subset,
+                                split="train",
+                                streaming=True
                             )
                         )
                         

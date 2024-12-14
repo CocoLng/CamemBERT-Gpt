@@ -1,12 +1,10 @@
 import logging
 from typing import Optional
 import os
-import shutil
 import torch
 import wandb
 from transformers import Trainer, TrainingArguments, RobertaForMaskedLM
 from .masking_monitor import MaskingMonitorCallback
-from torch.utils.data import DataLoader
 
 class CustomTrainer(Trainer):
     def __init__(self, data_loader=None, checkpoint_steps=5000, **kwargs):
@@ -15,6 +13,7 @@ class CustomTrainer(Trainer):
         self.dataset_size = data_loader._dataset_size if data_loader else None
         self.checkpoint_steps = checkpoint_steps
         self.tokens_processed = 0
+        self._initial_log_done = False
         
         # Utilisation de processing_class au lieu de tokenizer
         self.processing_class = kwargs.pop('processing_class', None)
@@ -33,6 +32,13 @@ class CustomTrainer(Trainer):
         if data_loader and 'train_dataset' not in kwargs:
             kwargs['train_dataset'] = data_loader.dataset
         
+        # Mise à jour pour utiliser le data_loader mis à jour
+        if data_loader:
+            self.data_loader = data_loader
+            self.dataset_size = data_loader._dataset_size
+            if 'train_dataset' not in kwargs or kwargs['train_dataset'] is None:
+                kwargs['train_dataset'] = data_loader.dataset  # Utilise le dataset du data_loader
+
         super().__init__(**kwargs)
         
         # Save initial configuration
@@ -80,7 +86,7 @@ class CustomTrainer(Trainer):
     def training_step(self, model, inputs, return_loss=True):
         """Training step with optimal monitoring and performance"""
         try:
-            # Validate inputs (validation critique pour le streaming)
+            # Validate inputs
             required_keys = {'input_ids', 'attention_mask', 'labels'}
             if not all(k in inputs for k in required_keys):
                 raise ValueError(f"Missing required keys: {required_keys - set(inputs.keys())}")
@@ -89,15 +95,17 @@ class CustomTrainer(Trainer):
             tokens_in_batch = inputs['input_ids'].size(0) * inputs['input_ids'].size(1)
             self.tokens_processed += tokens_in_batch
 
-            # Initial logging (une seule fois)
-            if self.state.global_step == 0:
+            # Initial logging (vraiment une seule fois)
+            if self.state.global_step == 0 and not self._initial_log_done:
                 self.logger.info(
                     f"Training started - Target: {self.dataset_size:,} tokens, "
                     f"Dataset: {self.data_loader.dataset_config.name}"
                 )
+                self._initial_log_done = True
 
-            # Get loss with vérification de validité
+            # Get loss avec vérification de validité
             loss = super().training_step(model, inputs, return_loss)
+
             if not torch.isfinite(loss):
                 self.logger.warning(
                     f"Non-finite loss detected at step {self.state.global_step}: {loss.item()}"
@@ -290,12 +298,12 @@ class TrainingConfig:
             self.logger.error(f"Error initializing model: {e}")
             raise
 
-    def setup_trainer(self, training_args: TrainingArguments):
+    def setup_trainer(self, training_args):
         try:
             if not self.data_loader.is_ready():
                 raise ValueError("Dataset not loaded")
 
-            # Vérifier que les données sont correctement tokenisées
+            # Nous gardons les vérifications nécessaires mais utilisons directement le dataset
             sample_batch = next(iter(self.data_loader.dataset))
             required_fields = {'input_ids', 'attention_mask', 'special_tokens_mask'}
             
@@ -314,13 +322,12 @@ class TrainingConfig:
             if not self.model:
                 self._initialize_model()
 
-            # Setup masking monitor
             masking_monitor = MaskingMonitorCallback(
                 tokenizer=self.tokenizer,
                 expected_mlm_probability=self.data_loader.mlm_probability
             )
 
-            # Setup trainer with explicit tokenizer
+            # Utiliser directement le dataset configuré
             self.trainer = CustomTrainer(
                 data_loader=self.data_loader,
                 model=self.model,
@@ -331,7 +338,7 @@ class TrainingConfig:
                 processing_class=self.tokenizer
             )
 
-            # Verify setup with the monitor
+            # Garder la vérification finale
             self._verify_training_setup(masking_monitor)
                     
         except Exception as e:
@@ -526,7 +533,6 @@ class TrainingConfig:
             self.logger.error(f"Training error: {e}")
             self.logger.exception("Full traceback:")
             return f"❌ Training error: {str(e)}"
-
     def _save_final_model(self):
         """Save final model with explicit tokenizer handling"""
         try:
