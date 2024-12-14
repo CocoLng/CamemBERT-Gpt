@@ -156,9 +156,11 @@ class DataLoader:
 
             # Setup streaming pipeline with proper data extraction
             self.dataset = self.dataset.shuffle(buffer_size=optimal_buffer)
-            # Apply text extraction
+            
+            # First, ensure text extraction preserves the text column
             self.dataset = self.dataset.map(
-                extract_text
+                extract_text,
+                remove_columns=[col for col in self.dataset.column_names if col != 'text']
             )
             
             # Verify we have text before proceeding
@@ -166,22 +168,24 @@ class DataLoader:
             if 'text' not in sample or not sample['text']:
                 raise ValueError("Failed to extract text from dataset")
 
-            # Apply tokenization
+            # Then apply tokenization
             self.dataset = self.dataset.map(
                 self._tokenize_function,
                 batched=True,
-                remove_columns=['text']  # Remove text after tokenization
+                remove_columns=['text']  # Remove text only after tokenization
             )
 
             # Verify initial samples
             masking_stats = self._verify_streaming_masking()
             
             return self._format_loading_status(size_gb, masking_stats, optimal_buffer)
+        
         except Exception as e:
             error_msg = f"Failed to load dataset: {str(e)}"
-            self.logger.error(error_msg, exc_info=True)  # Added exc_info for better debugging
+            self.logger.error(error_msg, exc_info=True)
             return f"❌ {error_msg}"
-        
+            
+            
     def _verify_streaming_masking(self) -> MaskingStats:
         """Verify masking on streaming data with proper type handling"""
         try:
@@ -460,21 +464,14 @@ def extract_text(example):
                         texts.append(item['text'])
                     elif isinstance(item, str):
                         texts.append(item)
-                example['text'] = ' '.join(texts)
+                return {'text': ' '.join(texts)}
             elif isinstance(example['text'], dict):
                 # mOSCAR format avec dict
-                example['text'] = example['text'].get('text', '')
+                return {'text': example['text'].get('text', '')}
             elif isinstance(example['text'], str):
                 # Simple string format
-                example['text'] = example['text']
-        
-        # Handle unexpected types for 'id' and 'meta'
-        if 'id' in example and not isinstance(example['id'], str):
-            example['id'] = str(example['id'])
-        if 'meta' in example and not isinstance(example['meta'], dict):
-            example['meta'] = {}
-        
-        return example
+                return {'text': example['text']}
+        return {'text': ''}
     except Exception as e:
-        logging.warning(f"Error processing example: {e}")
-        return {}
+        logging.error(f"Text extraction error: {e}")
+        return {'text': ''}

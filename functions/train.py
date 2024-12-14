@@ -29,6 +29,10 @@ class CustomTrainer(Trainer):
         # Override save_steps in training arguments
         kwargs['args'].save_steps = self.checkpoint_steps
         
+        # Ensure dataset is properly set
+        if data_loader and 'train_dataset' not in kwargs:
+            kwargs['train_dataset'] = data_loader.dataset
+        
         super().__init__(**kwargs)
         
         # Save initial configuration
