@@ -460,18 +460,20 @@ def extract_text(example):
                         texts.append(item['text'])
                     elif isinstance(item, str):
                         texts.append(item)
-                return {'text': ' '.join(texts)}
+                example['text'] = ' '.join(texts)
             elif isinstance(example['text'], dict):
                 # mOSCAR format avec dict
-                return {'text': example['text'].get('text', '')}
+                example['text'] = example['text'].get('text', '')
             elif isinstance(example['text'], str):
                 # Simple string format
-                return {'text': example['text']}
+                example['text'] = example['text']
+        
         # Handle unexpected types for 'id' and 'meta'
         if 'id' in example and not isinstance(example['id'], str):
             example['id'] = str(example['id'])
         if 'meta' in example and not isinstance(example['meta'], dict):
             example['meta'] = {}
+        
         return example
     except Exception as e:
         logging.warning(f"Error processing example: {e}")
