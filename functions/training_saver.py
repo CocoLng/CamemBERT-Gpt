@@ -1,6 +1,5 @@
 import logging
 import os
-import sys
 from typing import Optional
 
 import torch
@@ -157,47 +156,32 @@ class TrainingSaver:
         torch.save(final_metrics, metrics_path)
 
     def _save_final_model(self):
-        """Sauvegarde le modèle final avec gestion explicite du tokenizer."""
+        """Sauvegarde le modèle final directement dans le dossier weights."""
         try:
-            if not self.trainer:
-                self.logger.error("Trainer non initialisé")
+            if not hasattr(self, "model") or self.model is None:
+                self.logger.error("Model not initialized")
                 return
 
-            # Sauvegarder d'abord le modèle
-            self.trainer.save_model()
+            # Sauvegarder directement dans le dossier weights/
+            self.model.save_pretrained(
+                self.weights_dir,
+                safe_serialization=True  # Pour sauvegarder en format .safetensors
+            )
+            
+            if self.processing_class is not None:
+                self.processing_class.save_pretrained(self.weights_dir)
+
+            # Sauvegarder les métriques finales
+            self._save_final_metrics(os.path.join(self.weights_dir, "final_metrics.json"))
+            
+            self.logger.info(f"Final model saved in {self.weights_dir}")
 
             # Vérifier si wandb est actif
-            if not wandb.run:
-                self.logger.warning("WandB non initialisé")
-
-            # Vérifier si c'est vraiment la fin du training
-            training_finished = (
-                self.trainer.state.global_step >= self.trainer.args.max_steps
-            )
-
-            if training_finished:
-                self.logger.info("Entraînement terminé, modèle final sauvegardé.")
+            if wandb.run:
+                wandb.save(os.path.join(self.weights_dir, "*"))
 
         except Exception as e:
             self.logger.error(f"Error in _save_final_model: {e}")
             if wandb.run:
                 wandb.finish()
             raise
-
-    def stop_training(self):
-        """Arrête l'entraînement et nettoie."""
-        try:
-            self.logger.info("Stopping training...")
-
-            # Cleanup wandb (pour GPU)
-            if wandb.run is not None:
-                wandb.finish()
-            if self.trainer:
-                self._save_final_model()
-
-            self.logger.info("Training stopped successfully!")
-
-        except Exception as e:
-            self.logger.error(f"Error stopping training: {e}")
-            self.logger.exception("Exit failure")
-            sys.exit(1)
