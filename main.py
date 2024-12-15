@@ -1,13 +1,14 @@
 import logging
-import os
-import sys
-
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir)))
 
 from functions.run_handler import Run_Handler
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger("main")
+
+# Désactiver les logs du module datasets en dessous du niveau WARNING
+logging.getLogger("datasets_modules.datasets").setLevel(logging.WARNING)
 
 
 def main():
