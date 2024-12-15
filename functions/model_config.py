@@ -1,23 +1,39 @@
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from transformers import RobertaConfig, RobertaTokenizerFast
 
 
 @dataclass
 class ModelArguments:
-    """Arguments par défaut pour la configuration RoBERTa"""
-    vocab_size: int = 50265  # Taille par défaut de RoBERTa
+    """Arguments par défaut pour la configuration RoBERTa améliorée"""
+    # Paramètres existants
+    vocab_size: int = 50265
     max_position_embeddings: int = 514
     hidden_size: int = 768
     num_attention_heads: int = 12
     num_hidden_layers: int = 12
     intermediate_size: int = 3072
-    hidden_act: str = "gelu"
     hidden_dropout_prob: float = 0.1
     attention_probs_dropout_prob: float = 0.1
     type_vocab_size: int = 1
     layer_norm_eps: float = 1e-5
+    hidden_act: str = "gelu" # Activation par défaut RoBERTa
 
+    learning_rate: float = 6e-4  # Learning rate de base CamemBERT
+    warmup_ratio: float = 0.06   # 6% comme CamemBERT
+    weight_decay: float = 0.01   # Valeur par défaut AdamW
+    adam_epsilon: float = 1e-6   # Epsilon pour Adam
+    max_grad_norm: float = 1.0   # Gradient clipping
+    batch_size: int = 8192       # Taille batch recommandée
+
+    # Paramètres tokenizer
+    special_tokens: dict = field(default_factory=lambda: {
+        'pad_token': '<pad>',
+        'bos_token': '<s>',
+        'eos_token': '</s>',
+        'unk_token': '<unk>',
+        'mask_token': '<mask>'
+    })
 
 class ModelConfig:
     """Gestionnaire de configuration du modèle RoBERTa"""

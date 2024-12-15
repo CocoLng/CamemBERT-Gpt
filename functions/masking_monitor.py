@@ -68,10 +68,14 @@ class MaskingMonitorCallback(TrainerCallback):
                    control: TrainerControl, **kwargs):
         """Monitor training steps"""
         if state.global_step % self.check_frequency == 0:
-            stats = self.analyze_batch(kwargs.get('inputs', {}))
-            
-            if stats and wandb.run is not None:
-                wandb.log({
-                    "masking/current_masking_ratio": stats["current_masking_ratio"],
-                    "masking/total_masks": stats["total_masks"]
-                }, step=state.global_step)
+            # Récupérer les inputs depuis le trainer
+            trainer = kwargs.get('trainer')
+            if trainer and hasattr(trainer, '_current_inputs'):
+                inputs = trainer._current_inputs
+                stats = self.analyze_batch(inputs)
+                
+                if stats and wandb.run is not None:
+                    wandb.log({
+                        "masking/current_masking_ratio": stats["current_masking_ratio"],
+                        "masking/total_masks": stats["total_masks"]
+                    }, step=state.global_step)

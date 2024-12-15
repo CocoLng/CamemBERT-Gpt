@@ -106,6 +106,9 @@ class CustomTrainer(Trainer):
             # Get loss avec vérification de validité
             loss = super().training_step(model, inputs, return_loss)
 
+            # Passer les inputs au callback via un attribut temporaire
+            self._current_inputs = inputs
+
             if not torch.isfinite(loss):
                 self.logger.warning(
                     f"Non-finite loss detected at step {self.state.global_step}: {loss.item()}"
