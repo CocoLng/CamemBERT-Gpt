@@ -2,6 +2,7 @@ import logging
 import math
 import os
 import sys
+import time
 
 import torch
 import wandb
@@ -27,6 +28,16 @@ class CustomTrainer(TrainingSaver, Trainer):
         self.tokens_processed = 0
         self._initial_log_done = False
         self.masking_handler = kwargs.pop("masking_handler", None)
+        self.training_start_time = None
+        self.loss_history = []
+
+        # Initialisation des métriques Wandb si CUDA est disponible
+        if torch.cuda.is_available():
+            wandb.define_metric("training/loss", summary="min")
+            wandb.define_metric("training/loss_distribution")
+            wandb.define_metric("training/elapsed_hours")
+            wandb.define_metric("masking/ratio", summary="mean")
+            wandb.run.summary["training_start"] = wandb.run.start_time
 
         # Configuration du data_loader et ses attributs
         self.data_loader = data_loader
@@ -52,9 +63,17 @@ class CustomTrainer(TrainingSaver, Trainer):
         if hasattr(self, "model") and self.model is not None:
             self._save_model_info(self.run_dir)
 
+    def _init_training(self):
+        """Initialise les paramètres de suivi d'entraînement"""
+        self.training_start_time = time.time()
+        self.loss_history = []
+
     def training_step(self, model, inputs, return_loss=True):
-        """Étape d'entraînement avec surveillance et performance optimales."""
+        """Étape d'entraînement avec surveillance et graphiques améliorés"""
         try:
+            if self.state.global_step == 0:
+                self._init_training()
+
             required_keys = {"input_ids", "attention_mask", "labels"}
             if not all(k in inputs for k in required_keys):
                 raise ValueError(
@@ -65,7 +84,7 @@ class CustomTrainer(TrainingSaver, Trainer):
             tokens_in_batch = inputs["input_ids"].size(0) * inputs["input_ids"].size(1)
             self.tokens_processed += tokens_in_batch
 
-            # Initial logging (vraiment une seule fois)
+            # Initial logging 
             if self.state.global_step == 0 and not self._initial_log_done:
                 target_size = self.dataset_size if self.dataset_size else "unknown"
                 dataset_name = (
@@ -95,6 +114,27 @@ class CustomTrainer(TrainingSaver, Trainer):
                 and self.state.global_step % self.checkpoint_steps == 0
             ):
                 self._save_checkpoint_internal(self.state.global_step)
+
+            # Mise à jour des métriques si CUDA est disponible
+            if torch.cuda.is_available() and wandb.run is not None:
+                # Stockage de la perte pour la distribution
+                self.loss_history.append(loss.item())
+                
+                # Calcul du temps écoulé
+                elapsed_hours = (time.time() - self.training_start_time) / 3600
+                
+                # Log des métriques
+                metrics = {
+                    "training/loss": loss.item(),
+                    "training/elapsed_hours": elapsed_hours,
+                }
+                
+                # Ajout de la distribution des pertes tous les 100 steps
+                if self.state.global_step % 100 == 0 and self.loss_history:
+                    metrics["training/loss_distribution"] = wandb.Histogram(self.loss_history)
+                    self.loss_history = self.loss_history[-1000:]  # Garder les 1000 dernières valeurs
+                
+                wandb.log(metrics, step=self.state.global_step)
 
             return loss
 
@@ -138,6 +178,16 @@ class CustomTrainer(TrainingSaver, Trainer):
             self._save_metrics_report(checkpoint_path)
 
             self.logger.info(f"Checkpoint saved to {checkpoint_path}")
+
+        if torch.cuda.is_available() and wandb.run is not None:
+            # Ajout des métriques de checkpoint dans wandb
+            elapsed_hours = (time.time() - self.training_start_time) / 3600
+            checkpoint_metrics = {
+                "checkpoint/step": step,
+                "checkpoint/elapsed_hours": elapsed_hours,
+                "checkpoint/tokens_processed": self.tokens_processed,
+            }
+            wandb.log(checkpoint_metrics, step=step)
 
     def _save_checkpoint(self, model=None, trial=None, metrics=None):
         """Surcharge de la méthode Trainer pour assurer la compatibilité"""
@@ -443,7 +493,7 @@ class TrainingConfig:
                     self.trainer._save_final_model()  # Cette méthode sauvegarde maintenant directement dans weights/
 
                     logging.info("Final model saved successfully")
-                    
+
                     # Log des métriques finales dans wandb
                     if wandb.run is not None:
                         try:
