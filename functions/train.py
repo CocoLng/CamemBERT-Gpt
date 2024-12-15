@@ -1,6 +1,7 @@
 import logging
 from typing import Optional
 import os
+import sys
 import torch
 import wandb
 from transformers import Trainer, TrainingArguments, RobertaForMaskedLM
@@ -102,6 +103,13 @@ class CustomTrainer(Trainer):
                     f"Dataset: {self.data_loader.dataset_config.name}"
                 )
                 self._initial_log_done = True
+
+            # Ajouter un log des epochs
+            if hasattr(self.state, "epoch"):
+                current_epoch = int(self.state.epoch)
+                if not hasattr(self, "_last_logged_epoch") or self._last_logged_epoch != current_epoch:
+                    self.logger.info(f"Starting epoch {current_epoch + 1}")
+                    self._last_logged_epoch = current_epoch
 
             # Get loss avec vérification de validité
             loss = super().training_step(model, inputs, return_loss)
@@ -494,8 +502,8 @@ class TrainingConfig:
         try:
             if not self.model:
                 return "❌ Model not initialized"
-
-            # Get training parameters
+            cuda_available = torch.cuda.is_available() and use_cuda
+            
             training_params = self._calculate_training_parameters()
             training_args = training_params['training_args']
             
@@ -520,7 +528,7 @@ class TrainingConfig:
                 output_dir=self.run_dir,
                 **training_args,
                 fp16=cuda_available and fp16_training,
-                dataloader_pin_memory=cuda_available,  # Set this only here
+                dataloader_pin_memory=cuda_available,
                 report_to="wandb" if cuda_available else "none",
             )
 
@@ -528,14 +536,47 @@ class TrainingConfig:
             self.setup_trainer(args)
             
             self.logger.info("Starting training...")
-            self.trainer.train()
+            training_result = self.trainer.train()
+            
+            # Vérification de fin d'entraînement
+            if training_result:
+                self.logger.info("Training completed. Verifying final state...")
+                training_finished = (
+                    self.trainer.state.global_step >= self.trainer.args.max_steps and
+                    self.trainer.state.epoch >= self.trainer.args.num_train_epochs
+                )
+                
+                if training_finished:
+                    self.logger.info("Training reached its natural end. Saving final state...")
+                    # Sauvegarde finale du modèle
+                    self.trainer.save_model()
+                    
+                    # Log des métriques finales dans wandb
+                    if wandb.run is not None:
+                        try:
+                            final_metrics = {
+                                "final_loss": self.trainer.state.log_history[-1].get("loss", None),
+                                "total_steps": self.trainer.state.global_step,
+                                "total_epochs": self.trainer.state.epoch,
+                                "training_status": "completed"
+                            }
+                            wandb.log(final_metrics)
+                            self.logger.info("Final metrics logged to wandb")
+                        except Exception as e:
+                            self.logger.error(f"Error logging final metrics to wandb: {e}")
+                        finally:
+                            wandb.finish()
+                            self.logger.info("Wandb run finished and closed")
             
             return "✅ Training completed successfully!"
 
         except Exception as e:
             self.logger.error(f"Training error: {e}")
             self.logger.exception("Full traceback:")
+            if wandb.run is not None:
+                wandb.finish()
             return f"❌ Training error: {str(e)}"
+
     def _save_final_model(self):
         """Save final model with explicit tokenizer handling"""
         try:
@@ -587,11 +628,10 @@ class TrainingConfig:
             # Save final model state
             if self.trainer:
                 self.trainer.save_model()
-            
-            # Force exit
-            import sys
-            sys.exit(0)
-            
+
+            self.logger.info("Training stopped successfully!")
+        
         except Exception as e:
-            self.logger.error(f"Error during training stop: {e}")
+            self.logger.error(f"Error stopping training: {e}")
+            self.logger.exception("Exit failure")
             sys.exit(1)
