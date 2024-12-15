@@ -2,7 +2,10 @@ import logging
 
 from functions.run_handler import Run_Handler
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger("main")
 
 # Désactiver les logs du module datasets en dessous du niveau WARNING

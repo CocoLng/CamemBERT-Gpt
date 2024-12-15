@@ -290,9 +290,17 @@ class DataLoader:
             if text.strip():
                 return self.visualize_masking(text)
             
-            # Sinon prendre un exemple du stream
-            sample = next(iter(self.dataset))
-            text = sample['text']
+            # Sinon prendre un exemple du stream et le détokenizer
+            try:
+                sample = next(iter(self.dataset))
+                # Convertir les input_ids en texte
+                text = self.tokenizer.decode(
+                    sample['input_ids'], 
+                    skip_special_tokens=True
+                )
+            except Exception as e:
+                self.logger.error(f"Erreur lors de la récupération du sample: {e}")
+                return "Erreur: Impossible de récupérer un exemple du dataset", ""
             
             # Vérifier densité
             tokens = self.tokenizer(text, truncation=True, max_length=512)
@@ -301,9 +309,10 @@ class DataLoader:
             if current_density >= density:
                 return self.visualize_masking(text)
             else:
-                return "Text density too low", ""
+                return "Densité de texte trop faible", ""
                 
         except Exception as e:
+            self.logger.error(f"Error in visualize_with_density: {e}")
             return f"Error: {str(e)}", ""
 
     def visualize_masking(self, text: str) -> tuple[str, str]:
@@ -453,6 +462,37 @@ class DataLoader:
                 f"Target size: {size_gb:.1f} GB\n"
                 f"Shuffle buffer: {buffer_size:,} examples\n"
                 f"Sample masking ratio: {stats.average_ratio:.2%} (target: {self.mlm_probability:.1%})")
+
+    def initialize_and_load_dataset(self, choice: str, size: float, prob: float) -> str:
+        """Initialise le DataLoader avec la configuration du dataset spécifiée par l'utilisateur"""
+        try:
+            dataset_mapping = {
+                "mOSCAR (default)": "oscar-corpus/mOSCAR",
+                "OSCAR-2301": "oscar-corpus/OSCAR-2301"
+            }
+            dataset_name = dataset_mapping.get(choice)
+            if not dataset_name:
+                return f"❌ Dataset '{choice}' non reconnu."
+
+            subset = "fra_Latn" if choice == "mOSCAR (default)" else "fr"
+
+            # Met à jour la configuration du dataset
+            self.dataset_config = DatasetConfig(
+                name=dataset_name,
+                subset=subset,
+                split="train",
+                streaming=True
+            )
+            self.mlm_probability = prob
+            self.data_collator = self._initialize_data_collator()
+
+            status = self.load_streaming_dataset(size)
+            # Notification visuelle
+            logging.info("Dataset chargé avec succès")
+            return status
+
+        except Exception as e:
+            return f"❌ Erreur: {str(e)}"
 
     
 def extract_text(example):

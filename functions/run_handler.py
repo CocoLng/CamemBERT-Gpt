@@ -24,16 +24,6 @@ class Run_Handler:
         self.base_dir = "camembert-training"
         
 
-    def _initialize_data_loader(self, dataset_name: str, subset: str) -> DataLoader:
-        """Initialize data loader with specified dataset configuration"""
-        dataset_config = DatasetConfig(
-            name=dataset_name,
-            subset=subset,
-            split="train",
-            streaming=True
-        )
-        return DataLoader(dataset_config=dataset_config)
-
     def create_interface(self) -> gr.Blocks:
         """Create the Gradio interface"""
         with gr.Blocks(title="CamemBERT Training Interface") as interface:
@@ -344,28 +334,6 @@ class Run_Handler:
                     inputs=[model_source, available_runs, test_checkpoints],
                     outputs=[model_load_status]
                 )
-                # Modification de la fonction de chargement du modèle
-                def load_model_handler(source, run_name, checkpoint=None):
-                    """Gère le chargement du modèle en fonction de la source"""
-                    try:
-                        if not run_name:
-                            return "❌ Veuillez sélectionner un run"
-                        
-                        # Construire le chemin complet du run
-                        run_dir = os.path.join(self.base_dir, run_name)
-                        
-                        if source == "Checkpoint":
-                            if not checkpoint:
-                                return "❌ Veuillez sélectionner un checkpoint"
-                            path = os.path.join(run_dir, checkpoint)
-                        else:  # Weights
-                            path = os.path.join(run_dir, "weights")
-                            
-                        return self._load_model_for_testing(source, run_dir, path)
-                        
-                    except Exception as e:
-                        return f"❌ Erreur lors du chargement: {str(e)}"
-
         
                 gr.Markdown("### Test de Génération de Texte")
                 with gr.Row():
@@ -496,10 +464,10 @@ class Run_Handler:
 
             # Event Handlers
             load_btn.click(
-                    fn=initialize_and_load_dataset,
-                    inputs=[dataset_choice, dataset_size, masking_prob],
-                    outputs=[load_status],
-                )
+                fn=lambda choice, size, prob: self.data_loader.initialize_and_load_dataset(choice, size, prob),
+                inputs=[dataset_choice, dataset_size, masking_prob],
+                outputs=[load_status],
+            )
 
             visualize_btn.click(
                     fn=self.data_loader.visualize_with_density,
