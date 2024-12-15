@@ -1,10 +1,8 @@
 import logging
-import torch
 from typing import Dict, List, Optional
 from dataclasses import dataclass
-from datasets import load_dataset
-from transformers import DataCollatorForLanguageModeling, RobertaTokenizerFast
-from datasets import Dataset
+from datasets import load_dataset, Dataset
+from transformers import RobertaTokenizerFast
 import os
 import psutil
 import numpy as np
@@ -26,7 +24,6 @@ class DatasetConfig:
         try:
             mem_available = psutil.virtual_memory().available / (1024**3)
             
-            # Conservative buffer sizing for streaming
             if target_size_gb < 5:
                 base_buffer = 25000
             elif target_size_gb < 20:
@@ -34,77 +31,31 @@ class DatasetConfig:
             else:
                 base_buffer = 100000
                 
-            # Use maximum 15% of available memory for buffer
             mem_factor = min(mem_available * 0.15 / target_size_gb, 1.0)
             return int(base_buffer * mem_factor)
         except Exception as e:
             logging.warning(f"Buffer size calculation failed: {e}, using default")
             return 10000
 
-@dataclass
-class MaskingResult:
-    """Structure for masking results with clear metrics"""
-    original_text: str
-    masked_text: str
-    masking_ratio: float
-    num_masked_tokens: int
-    total_tokens: int
-
-@dataclass
-class MaskingStats:
-    """Structure for masking statistics"""
-    average_ratio: float
-    num_samples: int
-    expected_ratio: float
-    deviation: float
-
 class DataLoader:
+    """Handles dataset loading and preprocessing for CamemBERT training"""
+    
     def __init__(
         self,
         dataset_config: Optional[DatasetConfig] = None,
-        tokens_to_fuse: Optional[List[str]] = None,
-        tokens_to_remove: Optional[List[str]] = None
     ):
         self.logger = logging.getLogger(__name__)
         self.tokenizer = self._initialize_tokenizer()
         self.dataset = None
         self._dataset_size = 0
         self.dataset_config = dataset_config or DatasetConfig()
-        self.mlm_probability = 0.15  # Fixed as per RoBERTa
-        self.data_collator = self._initialize_data_collator()
-        
-        # Token processing configuration
-        self.tokens_to_fuse = tokens_to_fuse or []
-        self.tokens_to_remove = tokens_to_remove or []
-
-    def _initialize_data_collator(self) -> DataCollatorForLanguageModeling:
-        """Initialize standard RoBERTa MLM collator"""
-        return DataCollatorForLanguageModeling(
-            tokenizer=self.tokenizer,
-            mlm=True,
-            mlm_probability=self.mlm_probability,
-            pad_to_multiple_of=8 
-        )
-        
 
     def _initialize_tokenizer(self) -> RobertaTokenizerFast:
-        """Initialize RoBERTa tokenizer with error handling"""
+        """Initialize RoBERTa tokenizer"""
         try:
             return RobertaTokenizerFast.from_pretrained("roberta-base")
         except Exception as e:
             self.logger.error(f"Failed to initialize tokenizer: {e}")
-            raise
-
-    def _prepare_dataset(self, dataset: Dataset) -> Dataset:
-        """
-        Prepare dataset with proper text extraction.
-        """
-        try:
-            # Apply the transformation and keep only the text column
-            dataset = dataset.map(extract_text)
-            return dataset.select_columns(['text'])
-        except Exception as e:
-            self.logger.error(f"Error preparing dataset: {e}")
             raise
 
     def _tokenize_function(self, examples: Dict) -> Dict:
@@ -124,7 +75,6 @@ class DataLoader:
                 return_attention_mask=True
             )
             
-            # Ensure all values are lists (not dicts)
             return {k: list(v) if isinstance(v, (list, np.ndarray)) else v 
                 for k, v in tokenized.items()}
                 
@@ -132,7 +82,43 @@ class DataLoader:
             self.logger.error(f"Tokenization error: {e}", exc_info=True)
             raise
 
-    def load_streaming_dataset(self, size_gb: float) -> str:
+    def prepare_dataset(self, dataset: Dataset) -> Dataset:
+        """Prepare dataset with proper text extraction and tokenization"""
+        try:
+            # Extraire le texte et tokenizer
+            dataset = dataset.map(self._extract_text)
+            dataset = dataset.select_columns(['text'])
+            dataset = dataset.map(
+                self._tokenize_function,
+                batched=True,
+                remove_columns=['text']
+            )
+            return dataset
+            
+        except Exception as e:
+            self.logger.error(f"Dataset preparation error: {e}")
+            raise
+
+    @staticmethod
+    def _extract_text(example: Dict) -> Dict:
+        """Extract text content from various dataset formats"""
+        try:
+            if 'text' in example:
+                if isinstance(example['text'], list):
+                    texts = [item['text'] if isinstance(item, dict) else item 
+                            for item in example['text']]
+                    return {'text': ' '.join(texts)}
+                elif isinstance(example['text'], dict):
+                    return {'text': example['text'].get('text', '')}
+                elif isinstance(example['text'], str):
+                    return {'text': example['text']}
+            return {'text': ''}
+        except Exception as e:
+            logging.error(f"Text extraction error: {e}")
+            return {'text': ''}
+
+    def load_dataset(self, size_gb: float) -> bool:
+        """Load dataset with specified size in GB"""
         try:
             # Calculate dataset size in tokens
             bytes_per_token = 4
@@ -154,287 +140,18 @@ class DataLoader:
             if not self.dataset:
                 raise ValueError(f"Failed to load dataset {self.dataset_config.name}")
 
-            # Setup streaming pipeline with proper data extraction
+            # Configure streaming pipeline
             self.dataset = self.dataset.shuffle(buffer_size=optimal_buffer)
+            self.dataset = self.prepare_dataset(self.dataset)
             
-            # First, ensure text extraction preserves the text column
-            self.dataset = self.dataset.map(
-                extract_text,
-                remove_columns=[col for col in self.dataset.column_names if col != 'text']
-            )
-            
-            # Verify we have text before proceeding
-            sample = next(iter(self.dataset))
-            if 'text' not in sample or not sample['text']:
-                raise ValueError("Failed to extract text from dataset")
-
-            # Then apply tokenization
-            self.dataset = self.dataset.map(
-                self._tokenize_function,
-                batched=True,
-                remove_columns=['text']  # Remove text only after tokenization
-            )
-
-            # Verify initial samples
-            masking_stats = self._verify_streaming_masking()
-            
-            # Log custom message
-            self.logger.info(f"Dataset {self.dataset_config.name} loaded successfully with size {size_gb} GB")
-            
-            return self._format_loading_status(size_gb, masking_stats, optimal_buffer)
-        
-        except Exception as e:
-            error_msg = f"Failed to load dataset: {str(e)}"
-            self.logger.error(error_msg, exc_info=True)
-            return f"❌ {error_msg}"
-            
-            
-    def _verify_streaming_masking(self) -> MaskingStats:
-        """Verify masking on streaming data with proper type handling"""
-        try:
-            total_ratio = 0
-            samples_checked = 0
-            max_samples = 5
-
-            # Sample a few batches for verification
-            iterator = iter(self.dataset)
-            for _ in range(max_samples):
-                try:
-                    sample = next(iterator)
-                    
-                    # Debug logging
-                    self.logger.debug(f"Sample keys: {sample.keys()}")
-                    for k, v in sample.items():
-                        self.logger.debug(f"Key: {k}, Type: {type(v)}")
-                    
-                    # Ensure all required keys are present and properly formatted
-                    required_keys = {'input_ids', 'attention_mask', 'special_tokens_mask'}
-                    if not all(k in sample for k in required_keys):
-                        missing = required_keys - set(sample.keys())
-                        raise ValueError(f"Missing required keys in sample: {missing}")
-                    
-                    # Convert to tensors with explicit type checking
-                    sample_tensor = {}
-                    for k, v in sample.items():
-                        if isinstance(v, (list, np.ndarray)):
-                            sample_tensor[k] = torch.tensor(v, dtype=torch.long)
-                        elif isinstance(v, torch.Tensor):
-                            sample_tensor[k] = v
-                        else:
-                            self.logger.warning(f"Unexpected type for key {k}: {type(v)}")
-                            continue
-                    
-                    # Proceed only if we have valid tensors
-                    if not all(k in sample_tensor for k in required_keys):
-                        continue
-                    
-                    masked_batch = self.data_collator([sample_tensor])
-                    
-                    attention_mask = sample_tensor['attention_mask']
-                    masked_tokens = (masked_batch['labels'][0] != -100).sum().item()
-                    valid_tokens = attention_mask.sum().item()
-                    
-                    if valid_tokens > 0:
-                        total_ratio += masked_tokens / valid_tokens
-                        samples_checked += 1
-                        
-                except StopIteration:
-                    break
-                except Exception as e:
-                    self.logger.warning(f"Error processing sample: {e}")
-                    continue
-
-            if samples_checked == 0:
-                raise ValueError("No valid samples found for masking verification")
-
-            avg_ratio = total_ratio / samples_checked
-            
-            return MaskingStats(
-                average_ratio=avg_ratio,
-                num_samples=samples_checked,
-                expected_ratio=self.mlm_probability,
-                deviation=abs(avg_ratio - self.mlm_probability)
-            )
+            return True
             
         except Exception as e:
-            self.logger.error(f"Error in masking verification: {e}", exc_info=True)
-            raise
-
-        
-    def _prepare_text(self, example: Dict) -> Dict:
-        """Prepare text from streaming example"""
-        if 'text' in example and isinstance(example['text'], list):
-            texts = [item['text'] for item in example['text']]
-            return {'text': ' '.join(texts)}
-        elif 'content' in example:
-            return {'text': example['content']}
-        elif 'text' in example and isinstance(example['text'], str):
-            return {'text': example['text']}
-        return {'text': ''}
-
-    def load_with_masking(self, size: float, prob: float) -> str:
-        """Legacy method for compatibility with run_handler"""
-        try:
-            self.mlm_probability = prob
-            self.data_collator = self._initialize_data_collator()
-            return self.load_streaming_dataset(size)
-        except Exception as e:
-            error_msg = f"Error during loading: {e}"
-            self.logger.error(error_msg)
-            return error_msg
-
-    def visualize_with_density(self, text: str, density: float) -> tuple[str, str]:
-        """Visualize masking without dataset dependency"""
-        try:
-            # Si texte fourni, utiliser directement
-            if text.strip():
-                return self.visualize_masking(text)
-            
-            # Sinon prendre un exemple du stream et le détokenizer
-            try:
-                sample = next(iter(self.dataset))
-                # Convertir les input_ids en texte
-                text = self.tokenizer.decode(
-                    sample['input_ids'], 
-                    skip_special_tokens=True
-                )
-            except Exception as e:
-                self.logger.error(f"Erreur lors de la récupération du sample: {e}")
-                return "Erreur: Impossible de récupérer un exemple du dataset", ""
-            
-            # Vérifier densité
-            tokens = self.tokenizer(text, truncation=True, max_length=512)
-            current_density = sum(tokens['attention_mask']) / len(tokens['attention_mask'])
-            
-            if current_density >= density:
-                return self.visualize_masking(text)
-            else:
-                return "Densité de texte trop faible", ""
-                
-        except Exception as e:
-            self.logger.error(f"Error in visualize_with_density: {e}")
-            return f"Error: {str(e)}", ""
-
-    def visualize_masking(self, text: str) -> tuple[str, str]:
-        """Visualize masking of input text"""
-        try:
-            if not text or not text.strip():
-                return "❌ Texte vide", ""
-                
-            inputs = self.tokenizer(
-                text,
-                truncation=True,
-                max_length=512,
-                padding='max_length',
-                return_tensors="pt"
-            )
-
-            masked = self.data_collator([{
-                "input_ids": inputs["input_ids"][0],
-                "attention_mask": inputs["attention_mask"][0]
-            }])
-
-            original_text = self.tokenizer.decode(
-                inputs["input_ids"][0],
-                skip_special_tokens=True
-            )
-
-            masked_text = self.tokenizer.decode(
-                masked["input_ids"][0],
-                skip_special_tokens=False
-            )
-            
-            return original_text, masked_text
-        except Exception as e:
-            error_msg = f"❌ Erreur lors du masquage: {str(e)}"
-            self.logger.error(error_msg)
-            return error_msg, ""
-
-    def _verify_masking(self) -> MaskingStats:
-        """Verify masking on sample data"""
-        try:
-            samples = []
-            for sample in self.dataset.take(5):
-                sample = {
-                    'input_ids': torch.tensor(sample['input_ids']),
-                    'attention_mask': torch.tensor(sample['attention_mask'])
-                }
-                samples.append(sample)
-
-            stats = self._analyze_masking_samples(samples)
-            self._last_masking_stats = stats
-            
-            self.logger.info(
-                f"Masking verification - Expected: {self.mlm_probability:.2%}, "
-                f"Actual: {stats.average_ratio:.2%}"
-            )
-            
-            return stats
-            
-        except Exception as e:
-            self.logger.error(f"Error in masking verification: {e}")
-            raise
-
-    def _analyze_masking_samples(self, samples: List[Dict]) -> MaskingStats:
-        """Analyze masking statistics on multiple samples"""
-        total_ratio = 0
-        valid_samples = 0
-
-        for sample in samples:
-            masked_batch = self.data_collator([sample])
-            attention_mask = sample['attention_mask']
-            
-            if not isinstance(attention_mask, torch.Tensor):
-                attention_mask = torch.tensor(attention_mask)
-                
-            masked_tokens = (masked_batch['labels'][0] != -100).sum().item()
-            valid_tokens = attention_mask.sum().item()
-            
-            if valid_tokens > 0:
-                total_ratio += masked_tokens / valid_tokens
-                valid_samples += 1
-
-        average_ratio = total_ratio / valid_samples if valid_samples > 0 else 0
-        return MaskingStats(
-            average_ratio=average_ratio,
-            num_samples=valid_samples,
-            expected_ratio=self.mlm_probability,
-            deviation=abs(average_ratio - self.mlm_probability)
-        )
-
-    def get_random_text(self, min_density: float = 0.6) -> str:
-        """Get random text sample with minimum token density"""
-        if not self.is_ready():
-            raise ValueError("Dataset non chargé. Veuillez d'abord charger un dataset.")
-        
-        max_attempts = 20
-        for attempt in range(max_attempts):
-            try:
-                # Prendre un échantillon aléatoire
-                sample = next(iter(self.dataset.shuffle().take(1)))
-                attention_mask = torch.tensor(sample["attention_mask"])
-                density = attention_mask.sum().item() / len(attention_mask)
-                
-                if density >= min_density:
-                    return self.tokenizer.decode(sample["input_ids"], skip_special_tokens=True)
-                
-                if attempt == max_attempts - 1:
-                    self.logger.warning(
-                        f"Impossible de trouver un texte avec une densité >= {min_density} "
-                        f"après {max_attempts} tentatives"
-                    )
-                    
-            except Exception as e:
-                self.logger.error(f"Erreur lors de la sélection du texte: {e}")
-                raise ValueError("Erreur lors de l'accès au dataset")
-                
-        raise ValueError(
-            f"Impossible de trouver un texte avec une densité >= {min_density}. "
-            f"Essayez de réduire la densité minimale requise."
-        )
+            self.logger.error(f"Dataset loading error: {e}")
+            return False
 
     def is_ready(self) -> bool:
-        """Verify if streaming dataset is ready"""
+        """Check if dataset is properly loaded and ready for use"""
         if not self.dataset:
             self.logger.warning("Dataset not loaded")
             return False
@@ -444,7 +161,6 @@ class DataLoader:
             return False
                 
         try:
-            # Verify streaming functionality
             next(iter(self.dataset))
             return True
         except Exception as e:
@@ -455,66 +171,3 @@ class DataLoader:
     def dataset_size(self) -> int:
         """Get current dataset size in tokens"""
         return self._dataset_size
-
-    def _format_loading_status(self, size_gb: float, stats: MaskingStats, buffer_size: int) -> str:
-        """Format loading status with streaming metrics"""
-        return (f"✅ Dataset streaming initialized successfully!\n"
-                f"Target size: {size_gb:.1f} GB\n"
-                f"Shuffle buffer: {buffer_size:,} examples\n"
-                f"Sample masking ratio: {stats.average_ratio:.2%} (target: {self.mlm_probability:.1%})")
-
-    def initialize_and_load_dataset(self, choice: str, size: float, prob: float) -> str:
-        """Initialise le DataLoader avec la configuration du dataset spécifiée par l'utilisateur"""
-        try:
-            dataset_mapping = {
-                "mOSCAR (default)": "oscar-corpus/mOSCAR",
-                "OSCAR-2301": "oscar-corpus/OSCAR-2301"
-            }
-            dataset_name = dataset_mapping.get(choice)
-            if not dataset_name:
-                return f"❌ Dataset '{choice}' non reconnu."
-
-            subset = "fra_Latn" if choice == "mOSCAR (default)" else "fr"
-
-            # Met à jour la configuration du dataset
-            self.dataset_config = DatasetConfig(
-                name=dataset_name,
-                subset=subset,
-                split="train",
-                streaming=True
-            )
-            self.mlm_probability = prob
-            self.data_collator = self._initialize_data_collator()
-
-            status = self.load_streaming_dataset(size)
-            # Notification visuelle
-            logging.info("Dataset chargé avec succès")
-            return status
-
-        except Exception as e:
-            return f"❌ Erreur: {str(e)}"
-
-    
-def extract_text(example):
-    """Extract text with proper type handling"""
-    try:
-        if 'text' in example:
-            if isinstance(example['text'], list):
-                # mOSCAR format with list
-                texts = []
-                for item in example['text']:
-                    if isinstance(item, dict) and 'text' in item:
-                        texts.append(item['text'])
-                    elif isinstance(item, str):
-                        texts.append(item)
-                return {'text': ' '.join(texts)}
-            elif isinstance(example['text'], dict):
-                # mOSCAR format avec dict
-                return {'text': example['text'].get('text', '')}
-            elif isinstance(example['text'], str):
-                # Simple string format
-                return {'text': example['text']}
-        return {'text': ''}
-    except Exception as e:
-        logging.error(f"Text extraction error: {e}")
-        return {'text': ''}

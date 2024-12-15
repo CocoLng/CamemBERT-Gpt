@@ -5,7 +5,7 @@ import sys
 import torch
 import wandb
 from transformers import Trainer, TrainingArguments, RobertaForMaskedLM
-from .masking_monitor import MaskingMonitorCallback
+from .masking_monitor import MaskingMonitorCallback, MaskingHandler  # Ajout de MaskingHandler
 
 class CustomTrainer(Trainer):
     def __init__(self, data_loader=None, checkpoint_steps=5000, **kwargs):
@@ -40,6 +40,7 @@ class CustomTrainer(Trainer):
             if 'train_dataset' not in kwargs or kwargs['train_dataset'] is None:
                 kwargs['train_dataset'] = data_loader.dataset  # Utilise le dataset du data_loader
 
+        self.masking_handler = kwargs.pop('masking_handler', None)  # Ajout du masking_handler
         super().__init__(**kwargs)
         
         # Save initial configuration
@@ -77,12 +78,29 @@ class CustomTrainer(Trainer):
                     'gradient_accumulation_steps': self.args.gradient_accumulation_steps,
                     'save_steps': self.args.save_steps,
                     'logging_steps': self.args.logging_steps,
-                    'mlm_probability': self.data_loader.mlm_probability if self.data_loader else None
+                    'mlm_probability': self.masking_handler.mlm_probability if self.masking_handler else 0.15,  # Modification ici
+                    'fp16': self.args.fp16,
+                    'optimizer': "AdamW",
+                    'scheduler': self.args.lr_scheduler_type,
+                    'dataloader_num_workers': self.args.dataloader_num_workers,
+                    'device': str(self.args.device),
+                    'train_batch_size': self.args.train_batch_size,
                 }
                 for key, value in training_params.items():
                     f.write(f"{key}: {value}\n")
+                
+                # Dataset Configuration
+                f.write("\n=== Dataset Configuration ===\n")
+                if self.data_loader and self.data_loader.dataset_config:
+                    dataset_config = self.data_loader.dataset_config
+                    f.write(f"Dataset: {dataset_config.name}\n")
+                    f.write(f"Subset: {dataset_config.subset}\n")
+                    f.write(f"Split: {dataset_config.split}\n")
+                    f.write(f"Streaming: {dataset_config.streaming}\n")
+
         except Exception as e:
             self.logger.error(f"Error saving model info: {e}")
+            raise  # Ajout du raise pour mieux tracer les erreurs
 
     def training_step(self, model, inputs, return_loss=True):
         """Training step with optimal monitoring and performance"""
@@ -103,13 +121,6 @@ class CustomTrainer(Trainer):
                     f"Dataset: {self.data_loader.dataset_config.name}"
                 )
                 self._initial_log_done = True
-
-            # Ajouter un log des epochs
-            if hasattr(self.state, "epoch"):
-                current_epoch = int(self.state.epoch)
-                if not hasattr(self, "_last_logged_epoch") or self._last_logged_epoch != current_epoch:
-                    self.logger.info(f"Starting epoch {current_epoch + 1}")
-                    self._last_logged_epoch = current_epoch
 
             # Get loss avec vérification de validité
             loss = super().training_step(model, inputs, return_loss)
@@ -173,7 +184,6 @@ class CustomTrainer(Trainer):
             # 3. Save training state with stream information
             training_state = {
                 'global_step': self.state.global_step,
-                'epoch': self.state.epoch,
                 'tokens_processed': self.tokens_processed,
                 'target_size': self.dataset_size,
                 'log_history': self.state.log_history,
@@ -195,9 +205,8 @@ class CustomTrainer(Trainer):
             with open(report_path, "w") as f:
                 f.write("=== Training Report ===\n\n")
                 
-                # Current state
-                f.write(f"Global Step: {self.state.global_step}\n")
-                f.write(f"Epoch: {self.state.epoch}\n\n")
+                # Current state (removed epoch)
+                f.write(f"Global Step: {self.state.global_step}\n\n")
                 
                 # Learning rates
                 f.write("Learning Rates:\n")
@@ -248,6 +257,7 @@ class TrainingConfig:
         self.logger = logging.getLogger(__name__)
         self.model_config = model_config
         self.data_loader = data_loader
+        self.masking_handler = MaskingHandler(data_loader)  # Nouvelle instance
         self.trainer = None
         self.model = None
         self.tokenizer = data_loader.tokenizer  # Important: Stockage explicite du tokenizer
@@ -314,7 +324,7 @@ class TrainingConfig:
             if not self.data_loader.is_ready():
                 raise ValueError("Dataset not loaded")
 
-            # Nous gardons les vérifications nécessaires mais utilisons directement le dataset
+            # Utilisation de masking_handler pour le data_collator
             sample_batch = next(iter(self.data_loader.dataset))
             required_fields = {'input_ids', 'attention_mask', 'special_tokens_mask'}
             
@@ -323,7 +333,7 @@ class TrainingConfig:
                 raise ValueError(f"Dataset stream missing required fields: {missing_fields}")
                 
             # Vérifier que le collate_fn fonctionne
-            test_batch = self.data_loader.data_collator([sample_batch])
+            test_batch = self.masking_handler.data_collator([sample_batch])  # Modification ici
             required_batch_fields = {'input_ids', 'attention_mask', 'labels'}
             
             if not all(k in test_batch for k in required_batch_fields):
@@ -335,7 +345,7 @@ class TrainingConfig:
 
             masking_monitor = MaskingMonitorCallback(
                 tokenizer=self.tokenizer,
-                expected_mlm_probability=self.data_loader.mlm_probability
+                expected_mlm_probability=self.masking_handler.mlm_probability  # Utilisation de masking_handler
             )
 
             # Utiliser directement le dataset configuré
@@ -344,9 +354,10 @@ class TrainingConfig:
                 model=self.model,
                 args=training_args,
                 train_dataset=self.data_loader.dataset,
-                data_collator=self.data_loader.data_collator,
+                data_collator=self.masking_handler.data_collator,  # Utilisation de masking_handler
                 callbacks=[masking_monitor],
-                processing_class=self.tokenizer
+                processing_class=self.tokenizer,
+                masking_handler=self.masking_handler  # Ajout du masking_handler ici
             )
 
             # Garder la vérification finale
@@ -362,7 +373,7 @@ class TrainingConfig:
         try:
             # Test batch processing
             sample_batch = next(iter(self.data_loader.dataset))
-            test_batch = self.data_loader.data_collator([sample_batch])
+            test_batch = self.masking_handler.data_collator([sample_batch])  # Modification ici
             
             # Verify required tensors
             required_keys = {'input_ids', 'attention_mask', 'labels'}
@@ -382,72 +393,51 @@ class TrainingConfig:
             raise
     
     def _calculate_training_parameters(self) -> dict:
-        """
-        Calculate optimized training parameters for OSCAR/mOSCAR with adaptive configurations.
-        Key features:
-        - Fixed optimal batch size with gradient accumulation for effective batch size control
-        - RoBERTa-style learning rate schedule with proper warmup
-        - Dynamic steps and epochs based on dataset size
-        - Optimized cosine schedule with restarts
-        """
+        """Calculate training parameters using model_config values"""
         if not self.data_loader or not self.data_loader.dataset_size:
             raise ValueError("Dataset non initialisé")
 
-        # Fixed optimal batch size as per RoBERTa recommendations
+        model_args = self.model_config.model_args
+        
+        # Fixed optimal batch size per device
         cuda_available = torch.cuda.is_available()
-        base_batch_size = 75 if cuda_available else 16
+        base_batch_size = model_args.batch_size if cuda_available else 16
         optimal_workers = 4 if cuda_available else 2
 
         # Dataset Size Analysis
         dataset_size_gb = self.data_loader.dataset_size * 4 / (1024**3)
         
-        # Adaptive Gradient Accumulation for effective batch size control
-        # Smaller datasets need more accumulation for better convergence
+        gradient_acc = 16  # Default value
         if dataset_size_gb < 5:
-            gradient_acc = 8  # Effective batch size: 600
+            gradient_acc = 8
         elif dataset_size_gb < 20:
-            gradient_acc = 12  # Effective batch size: 900
-        else:
-            gradient_acc = 16  # Effective batch size: 1200
+            gradient_acc = 12
             
-        # Calculate effective batch size
         effective_batch_size = base_batch_size * gradient_acc
         
-        # RoBERTa-style Learning Rate Configuration
-        base_lr = 6e-4  # RoBERTa base learning rate
-        # Scale learning rate based on effective batch size
+        base_lr = model_args.learning_rate
         batch_scale = (effective_batch_size / 256) ** 0.5
         learning_rate = base_lr * batch_scale
         
-        # Calculate total batches and steps
+        # Calculate steps based on dataset size and batch size
         tokens_per_batch = base_batch_size * 512
         total_batches = self.data_loader.dataset_size // tokens_per_batch
         
-        # Adaptive number of epochs based on dataset size
-        if dataset_size_gb < 5:
-            num_epochs = 5  # More epochs for smaller datasets
-        elif dataset_size_gb < 20:
-            num_epochs = 3
-        else:
-            num_epochs = 2  # Fewer epochs for larger datasets
-            
-        # Calculate total steps based on real data size
-        updates_per_epoch = total_batches // gradient_acc
-        total_steps = updates_per_epoch * num_epochs
+        # Calculate total steps directly
+        updates_per_hour = 3600 / (2.5 * (effective_batch_size / 256))
+        total_steps = int(total_batches // gradient_acc)
         
-        # RoBERTa standard 6% warmup
-        warmup_steps = int(0.06 * total_steps)
+        # Use model_config warmup ratio
+        warmup_steps = int(model_args.warmup_ratio * total_steps)
         
         # Adaptive save frequency based on training progress
-        updates_per_hour = 3600 / (2.5 * (effective_batch_size / 256))
         save_interval_hours = 1.0 if dataset_size_gb < 20 else 2.0
         save_steps = max(100, int(updates_per_hour * save_interval_hours))
         
-        # Ensure reasonable number of saves (between 20 and 100 saves total)
+        # Ensure reasonable number of saves
         save_steps = min(save_steps, total_steps // 20)
         save_steps = max(save_steps, total_steps // 100)
         
-        # More frequent logging for better monitoring
         logging_steps = save_steps // 4
 
         # Hardware info string
@@ -458,7 +448,6 @@ class TrainingConfig:
             hardware_info = "🖥️ CPU (Test Local)"
 
         training_args = {
-            'num_train_epochs': num_epochs,
             'max_steps': total_steps,
             'learning_rate': learning_rate,
             'warmup_steps': warmup_steps,
@@ -467,12 +456,25 @@ class TrainingConfig:
             'gradient_accumulation_steps': gradient_acc,
             'per_device_train_batch_size': base_batch_size,
             'dataloader_num_workers': optimal_workers,
-            'weight_decay': 0.01,  # RoBERTa paper value
+            'weight_decay': model_args.weight_decay,
             'adam_beta1': 0.9,
-            'adam_beta2': 0.98,  # RoBERTa paper value
-            'max_grad_norm': 1.0,
-            'lr_scheduler_type': "cosine_with_restarts",  # Cosine schedule with restarts
+            'adam_beta2': 0.98,
+            'max_grad_norm': model_args.max_grad_norm,
+            'lr_scheduler_type': "cosine_with_restarts",
         }
+
+        log_message = (
+            f"Configuration optimisée pour {dataset_size_gb:.1f}GB sur {hardware_info}:\n"
+            f"- Batches totaux: {total_batches:,}\n"
+            f"- Steps maximum: {total_steps:,}\n"
+            f"- Learning rate: {learning_rate:.2e}\n"
+            f"- Gradient accumulation: {gradient_acc}\n"
+            f"- Batch size: {base_batch_size} (effectif: {effective_batch_size})\n"
+            f"- Nombre de workers: {optimal_workers}\n"
+            f"- Warmup steps: {warmup_steps:,}\n"
+            f"- Sauvegarde tous les {save_steps:,} steps (~{save_interval_hours:.1f}h)\n"
+            f"- Schedule: Cosine avec restarts"
+        )
 
         return {
             'training_args': training_args,
@@ -483,19 +485,7 @@ class TrainingConfig:
                 'estimated_hours': total_steps * (2.5 / 3600),
                 'hardware_setup': hardware_info
             },
-            'log_message': (
-                f"Configuration optimisée pour {dataset_size_gb:.1f}GB sur {hardware_info}:\n"
-                f"- Batches totaux: {total_batches:,}\n"
-                f"- Epochs: {num_epochs}\n"
-                f"- Steps maximum: {total_steps:,}\n"
-                f"- Learning rate: {learning_rate:.2e}\n"
-                f"- Gradient accumulation: {gradient_acc}\n"
-                f"- Batch size: {base_batch_size} (effectif: {effective_batch_size})\n"
-                f"- Nombre de workers: {optimal_workers}\n"
-                f"- Warmup steps: {warmup_steps:,} ({(warmup_steps/total_steps)*100:.1f}%)\n"
-                f"- Sauvegarde tous les {save_steps:,} steps (~{save_interval_hours:.1f}h)\n"
-                f"- Schedule: Cosine avec restarts"
-            )
+            'log_message': log_message
         }
 
     def start_training(self, output_dir: str, wandb_project: str, use_cuda: bool, fp16_training: bool) -> str:
@@ -541,13 +531,10 @@ class TrainingConfig:
             # Vérification de fin d'entraînement
             if training_result:
                 self.logger.info("Training completed. Verifying final state...")
-                training_finished = (
-                    self.trainer.state.global_step >= self.trainer.args.max_steps and
-                    self.trainer.state.epoch >= self.trainer.args.num_train_epochs
-                )
+                training_finished = self.trainer.state.global_step >= self.trainer.args.max_steps
                 
                 if training_finished:
-                    self.logger.info("Training reached its natural end. Saving final state...")
+                    self.logger.info("Training reached its target steps. Saving final state...")
                     # Sauvegarde finale du modèle
                     self.trainer.save_model()
                     
@@ -557,7 +544,6 @@ class TrainingConfig:
                             final_metrics = {
                                 "final_loss": self.trainer.state.log_history[-1].get("loss", None),
                                 "total_steps": self.trainer.state.global_step,
-                                "total_epochs": self.trainer.state.epoch,
                                 "training_status": "completed"
                             }
                             wandb.log(final_metrics)
@@ -591,17 +577,13 @@ class TrainingConfig:
                 return
                 
             # Vérifier si c'est vraiment la fin du training
-            training_finished = (
-                self.trainer.state.global_step >= self.trainer.args.max_steps or
-                self.trainer.state.epoch >= self.trainer.args.num_train_epochs
-            )
+            training_finished = self.trainer.state.global_step >= self.trainer.args.max_steps
 
             if training_finished:
                 try:
                     final_metrics = {
                         "final_loss": self.trainer.state.log_history[-1].get("loss", None),
                         "total_steps": self.trainer.state.global_step,
-                        "total_epochs": self.trainer.state.epoch,
                         "training_finished": True
                     }
                     wandb.log(final_metrics)

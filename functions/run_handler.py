@@ -10,6 +10,7 @@ from .data_loader import DataLoader, DatasetConfig
 from .model_config import ModelConfig
 from .test_predictor import TestPredictor
 from .fine_tuning import FineTuning
+from .masking_monitor import MaskingHandler  # Import de la nouvelle classe
 
 
 class Run_Handler:
@@ -21,6 +22,7 @@ class Run_Handler:
         self.training_config = None
         self.test_predictor = None
         self.fine_tuning = FineTuning()
+        self.masking_handler = MaskingHandler(self.data_loader)  # Instanciation de MaskingHandler
         self.base_dir = "camembert-training"
         
 
@@ -103,31 +105,8 @@ class Run_Handler:
 
                 def initialize_and_load_dataset(choice: str, size: float, prob: float) -> str:
                     """Initialise le DataLoader avec la configuration du dataset spécifiée par l'utilisateur"""
-                    try:
-                        dataset_name = dataset_mapping.get(choice)
-                        if not dataset_name:
-                            return "❌ Dataset non valide"
-                        
-                        subset = "fra_Latn" if choice == "mOSCAR (default)" else "fr"
-                        
-                        # Met à jour self.data_loader avec les paramètres sélectionnés
-                        self.data_loader = DataLoader(
-                            dataset_config=DatasetConfig(
-                                name=dataset_name,
-                                subset=subset,
-                                split="train",
-                                streaming=True
-                            )
-                        )
-                        
-                        status = self.data_loader.load_with_masking(size, prob)
-                        # Forcer le rafraîchissement du statut
-                        gr.Info("Dataset loaded successfully")  # Notification visuelle
-                        return status
-                        
-                    except Exception as e:
-                        return f"❌ Erreur: {str(e)}"
-
+                    return self.masking_handler.initialize_and_load_dataset(choice, size, prob)
+    
                 
             with gr.Tab("2. Configuration du Modèle"):
                 with gr.Row():
@@ -245,7 +224,7 @@ class Run_Handler:
                         checkpoint_info = gr.TextArea(
                             label="Informations du Checkpoint",
                             interactive=False,
-                            lines=10
+                            lines=8
                         )
 
                 with gr.Row():
@@ -464,13 +443,13 @@ class Run_Handler:
 
             # Event Handlers
             load_btn.click(
-                fn=lambda choice, size, prob: self.data_loader.initialize_and_load_dataset(choice, size, prob),
+                fn=initialize_and_load_dataset,
                 inputs=[dataset_choice, dataset_size, masking_prob],
                 outputs=[load_status],
             )
 
             visualize_btn.click(
-                    fn=self.data_loader.visualize_with_density,
+                    fn=self.masking_handler.visualize_with_density,
                     inputs=[masking_input, text_density],
                     outputs=[original_text, masked_text],
                 )
@@ -619,7 +598,7 @@ class Run_Handler:
             
             # Vérifier le dossier weights
             weights_path = os.path.join(run_dir, "weights")
-            if os.path.exists(weights_path):
+            if (os.path.exists(weights_path)):
                 checkpoints.append("weights")
                 
             # Chercher les checkpoints

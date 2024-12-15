@@ -166,4 +166,3 @@ class ModelConfig:
             self.logger.error(f"Erreur création configuration: {e}")
             raise
 
-    
