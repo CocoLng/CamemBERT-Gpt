@@ -156,28 +156,40 @@ class TrainingSaver:
         torch.save(final_metrics, metrics_path)
 
     def _save_final_model(self):
-        """Sauvegarde le modèle final directement dans le dossier weights."""
+        """Sauvegarde le modèle final et le tokenizer dans le dossier weights."""
         try:
             if not hasattr(self, "model") or self.model is None:
                 self.logger.error("Model not initialized")
                 return
 
-            # Sauvegarder directement dans le dossier weights/
+            # Création du dossier si nécessaire
+            os.makedirs(self.weights_dir, exist_ok=True)
+
+            # Sauvegarde du modèle
+            self.logger.info("Saving final model...")
             self.model.save_pretrained(
                 self.weights_dir,
-                safe_serialization=True  # Pour sauvegarder en format .safetensors
+                safe_serialization=True
             )
-            
-            if self.processing_class is not None:
-                self.processing_class.save_pretrained(self.weights_dir)
 
-            # Sauvegarder les métriques finales
+            # Sauvegarde explicite du tokenizer
+            if hasattr(self, "tokenizer"):
+                self.logger.info("Saving tokenizer...")
+                self.tokenizer.save_pretrained(self.weights_dir)
+            elif self.processing_class is not None:
+                self.logger.info("Saving processing class...")
+                self.processing_class.save_pretrained(self.weights_dir)
+            else:
+                self.logger.warning("No tokenizer or processing class found to save")
+
+            # Sauvegarde des métriques finales
             self._save_final_metrics(os.path.join(self.weights_dir, "final_metrics.json"))
             
-            self.logger.info(f"Final model saved in {self.weights_dir}")
+            self.logger.info(f"Final model and tokenizer saved in {self.weights_dir}")
 
-            # Vérifier si wandb est actif
+            # Synchronisation avec wandb si actif
             if wandb.run:
+                self.logger.info("Syncing with wandb...")
                 wandb.save(os.path.join(self.weights_dir, "*"))
 
         except Exception as e:

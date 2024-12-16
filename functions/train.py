@@ -2,7 +2,6 @@ import logging
 import math
 import os
 import sys
-import time
 
 import torch
 import wandb
@@ -35,7 +34,6 @@ class CustomTrainer(TrainingSaver, Trainer):
         if torch.cuda.is_available():
             wandb.define_metric("training/loss", summary="min")
             wandb.define_metric("training/loss_distribution")
-            wandb.define_metric("training/elapsed_hours")
             wandb.define_metric("masking/ratio", summary="mean")
             wandb.run.summary["training_start"] = wandb.run.start_time
 
@@ -63,16 +61,11 @@ class CustomTrainer(TrainingSaver, Trainer):
         if hasattr(self, "model") and self.model is not None:
             self._save_model_info(self.run_dir)
 
-    def _init_training(self):
-        """Initialise les paramètres de suivi d'entraînement"""
-        self.training_start_time = time.time()
-        self.loss_history = []
-
     def training_step(self, model, inputs, return_loss=True):
         """Étape d'entraînement avec surveillance et graphiques améliorés"""
         try:
             if self.state.global_step == 0:
-                self._init_training()
+                self.loss_history = []
 
             required_keys = {"input_ids", "attention_mask", "labels"}
             if not all(k in inputs for k in required_keys):
@@ -120,13 +113,10 @@ class CustomTrainer(TrainingSaver, Trainer):
                 # Stockage de la perte pour la distribution
                 self.loss_history.append(loss.item())
 
-                # Calcul du temps écoulé
-                elapsed_hours = (time.time() - self.training_start_time) / 3600
-
                 # Log des métriques
                 metrics = {
                     "training/loss": loss.item(),
-                    "training/elapsed_hours": elapsed_hours,
+                    "masking/ratio": self.masking_handler.current_masking_ratio,
                 }
 
                 # Ajout de la distribution des pertes tous les 100 steps
@@ -167,7 +157,6 @@ class CustomTrainer(TrainingSaver, Trainer):
                 "log_history": self.state.log_history,
                 "best_model_checkpoint": self.state.best_model_checkpoint,
                 "training_time": self.state.total_flos,
-                "epoch": self.state.epoch,
             }
 
             # Ajouter les métriques si présentes
@@ -185,11 +174,10 @@ class CustomTrainer(TrainingSaver, Trainer):
 
         if torch.cuda.is_available() and wandb.run is not None:
             # Ajout des métriques de checkpoint dans wandb
-            elapsed_hours = (time.time() - self.training_start_time) / 3600
             checkpoint_metrics = {
                 "checkpoint/step": step,
-                "checkpoint/elapsed_hours": elapsed_hours,
                 "checkpoint/tokens_processed": self.tokens_processed,
+                "checkpoint/loss": metrics.get("training/loss", None),
             }
             wandb.log(checkpoint_metrics, step=step)
 
@@ -355,8 +343,8 @@ class TrainingConfig:
         if torch.cuda.is_available():
             gpu_props = torch.cuda.get_device_properties(0)
             gpu_memory_gb = gpu_props.total_memory / (1024**3)
-            # Utilisation de 76 comme batch size optimal (95% utilisation GPU)
-            base_batch_size = 76
+            # Utilisation de 78 comme batch size optimal (98% utilisation GPU)
+            base_batch_size = 78
 
             # Calcul du gradient accumulation basé sur la taille du dataset
             memory_scaling = min(
@@ -404,9 +392,6 @@ class TrainingConfig:
         # Warmup steps (6% comme dans CamemBERT original)
         warmup_steps = int(0.06 * total_steps)
 
-        # Estimation du nombre de passages sur le dataset (epochs virtuels)
-        virtual_epochs = (total_steps * tokens_per_step) / self.data_loader.dataset_size
-
         # Configuration finale
         training_args = {
             "max_steps": total_steps,
@@ -440,7 +425,6 @@ class TrainingConfig:
             f"- Total Steps: {total_steps:,}\n"
             f"- Warmup Steps: {warmup_steps:,}\n"
             f"- Workers: {optimal_workers}\n"
-            f"- Virtual Epochs: {virtual_epochs:.1f}\n"
             f"- Tokens per Step: {tokens_per_step:,}\n"
             f"- Scheduler: Polynomial decay"
         )
@@ -450,7 +434,6 @@ class TrainingConfig:
             "info": {
                 "dataset_size_gb": dataset_size_gb,
                 "base_steps": base_steps,
-                "virtual_epochs": virtual_epochs,
                 "effective_batch_size": effective_batch_size,
                 "tokens_per_step": tokens_per_step,
                 "gpu_memory": gpu_memory_gb if torch.cuda.is_available() else 0,
