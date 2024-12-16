@@ -27,15 +27,6 @@ class CustomTrainer(TrainingSaver, Trainer):
         self.tokens_processed = 0
         self._initial_log_done = False
         self.masking_handler = kwargs.pop("masking_handler", None)
-        self.training_start_time = None
-        self.loss_history = []
-
-        # Initialisation des métriques Wandb si CUDA est disponible
-        if torch.cuda.is_available():
-            wandb.define_metric("training/loss", summary="min")
-            wandb.define_metric("training/loss_distribution")
-            wandb.define_metric("masking/ratio", summary="mean")
-            wandb.run.summary["training_start"] = wandb.run.start_time
 
         # Configuration du data_loader et ses attributs
         self.data_loader = data_loader
@@ -64,9 +55,6 @@ class CustomTrainer(TrainingSaver, Trainer):
     def training_step(self, model, inputs, return_loss=True):
         """Étape d'entraînement avec surveillance et graphiques améliorés"""
         try:
-            if self.state.global_step == 0:
-                self.loss_history = []
-
             required_keys = {"input_ids", "attention_mask", "labels"}
             if not all(k in inputs for k in required_keys):
                 raise ValueError(
@@ -106,32 +94,7 @@ class CustomTrainer(TrainingSaver, Trainer):
                 self.state.global_step > 0
                 and self.state.global_step % self.checkpoint_steps == 0
             ):
-                self._save_checkpoint_internal(self.state.global_step)
-
-            # Mise à jour des métriques si CUDA est disponible
-            if torch.cuda.is_available() and wandb.run is not None:
-                # Stockage de la perte pour la distribution
-                self.loss_history.append(loss.item())
-
-                # Log des métriques
-                metrics = {
-                    "training/loss": loss.item(),
-                }
-                
-                # Ajout du ratio de masquage s'il est disponible
-                if hasattr(self.masking_handler, "current_masking_ratio"):
-                    metrics["masking/ratio"] = self.masking_handler.current_masking_ratio
-
-                # Ajout de la distribution des pertes tous les 100 steps
-                if self.state.global_step % 100 == 0 and self.loss_history:
-                    metrics["training/loss_distribution"] = wandb.Histogram(
-                        self.loss_history
-                    )
-                    self.loss_history = self.loss_history[
-                        -1000:
-                    ]  # Garder les 1000 dernières valeurs
-
-                wandb.log(metrics, step=self.state.global_step)
+                self.save_checkpoint(self.state.global_step)
 
             return loss
 
@@ -139,54 +102,9 @@ class CustomTrainer(TrainingSaver, Trainer):
             self.logger.error(f"Error in training step: {e}")
             raise
 
-    def _save_checkpoint_internal(self, step, metrics=None):
-        """Helper interne pour gérer la sauvegarde des checkpoints"""
-        checkpoint_path = os.path.join(self.checkpoints_dir, f"checkpoint-{step}")
-
-        if not os.path.exists(checkpoint_path):
-            os.makedirs(checkpoint_path, exist_ok=True)
-
-            # Sauvegarder le modèle et le tokenizer une seule fois
-            self.model.save_pretrained(checkpoint_path)
-            if self.processing_class is not None:
-                self.processing_class.save_pretrained(checkpoint_path)
-                self.logger.info(f"Tokenizer saved to {checkpoint_path}")
-
-            # Sauvegarder l'état d'entraînement
-            training_state = {
-                "global_step": self.state.global_step,
-                "tokens_processed": self.tokens_processed,
-                "target_size": self.dataset_size,
-                "log_history": self.state.log_history,
-                "best_model_checkpoint": self.state.best_model_checkpoint,
-                "training_time": self.state.total_flos,
-            }
-
-            # Ajouter les métriques si présentes
-            if metrics:
-                training_state["metrics"] = metrics
-
-            torch.save(
-                training_state, os.path.join(checkpoint_path, "trainer_state.pt")
-            )
-
-            # Sauvegarder les métriques
-            self._save_metrics_report(checkpoint_path)
-
-            self.logger.info(f"Checkpoint saved to {checkpoint_path}")
-
-        if torch.cuda.is_available() and wandb.run is not None:
-            # Ajout des métriques de checkpoint dans wandb
-            checkpoint_metrics = {
-                "checkpoint/step": step,
-                "checkpoint/tokens_processed": self.tokens_processed,
-                "checkpoint/loss": metrics.get("training/loss", None),
-            }
-            wandb.log(checkpoint_metrics, step=step)
-
     def _save_checkpoint(self, model=None, trial=None, metrics=None):
         """Surcharge de la méthode Trainer pour assurer la compatibilité"""
-        self._save_checkpoint_internal(self.state.global_step, metrics=metrics)
+        self.save_checkpoint(self.state.global_step, metrics=metrics)
 
 
 class TrainingConfig:
@@ -498,10 +416,10 @@ class TrainingConfig:
                     self.logger.info(
                         "Training reached its target steps. Saving final state..."
                     )
-                    # Sauvegarde finale du modèle uniquement avec _save_final_model
-                    self.trainer._save_final_model()  # Cette méthode sauvegarde maintenant directement dans weights/
+                    # Appel à la méthode fusionnée save_model
+                    self.trainer.save_model()  # Sauvegarde le modèle final
 
-                    logging.info("Final model saved successfully")
+                    self.logger.info("Final model saved successfully")
 
                     # Log des métriques finales dans wandb
                     if wandb.run is not None:
@@ -541,7 +459,7 @@ class TrainingConfig:
             if wandb.run is not None:
                 wandb.finish()
             if self.trainer:
-                self.trainer.save_model()
+                self.trainer.save_model()  # Utilise la méthode save_model fusionnée
 
             self.logger.info("Training stopped successfully!")
 
