@@ -116,8 +116,11 @@ class CustomTrainer(TrainingSaver, Trainer):
                 # Log des métriques
                 metrics = {
                     "training/loss": loss.item(),
-                    "masking/ratio": self.masking_handler.current_masking_ratio,
                 }
+                
+                # Ajout du ratio de masquage s'il est disponible
+                if hasattr(self.masking_handler, "current_masking_ratio"):
+                    metrics["masking/ratio"] = self.masking_handler.current_masking_ratio
 
                 # Ajout de la distribution des pertes tous les 100 steps
                 if self.state.global_step % 100 == 0 and self.loss_history:

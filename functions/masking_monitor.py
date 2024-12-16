@@ -127,6 +127,7 @@ class MaskingHandler:
         self.data_loader = data_loader
         self.mlm_probability = 0.15  
         self.data_collator = self._initialize_data_collator()
+        self.current_masking_ratio = 0.0  # Ajout de l'attribut
 
     def _initialize_data_collator(self) -> DataCollatorForLanguageModeling:
         """Initialise le collateur pour le masquage"""
@@ -366,6 +367,15 @@ class MaskingHandler:
             f"Taille du buffer de mélange : {buffer_size:,} exemples\n"
             f"Ratio de masquage des échantillons : {stats.average_ratio:.2%} (cible : {self.mlm_probability:.1%})"
         )
+
+    def data_collator(self, examples):
+        batch = self.data_loader.data_collator(examples)
+        if 'labels' in batch:
+            # Calcul du ratio de masquage actuel
+            mask_tokens = (batch['labels'] != -100).sum().item()
+            total_tokens = batch['labels'].numel()
+            self.current_masking_ratio = mask_tokens / total_tokens if total_tokens > 0 else 0.0
+        return batch
 
 
 def extract_text(example):
