@@ -84,7 +84,7 @@ class CustomTrainer(TrainingSaver, Trainer):
             tokens_in_batch = inputs["input_ids"].size(0) * inputs["input_ids"].size(1)
             self.tokens_processed += tokens_in_batch
 
-            # Initial logging 
+            # Initial logging
             if self.state.global_step == 0 and not self._initial_log_done:
                 target_size = self.dataset_size if self.dataset_size else "unknown"
                 dataset_name = (
@@ -119,21 +119,25 @@ class CustomTrainer(TrainingSaver, Trainer):
             if torch.cuda.is_available() and wandb.run is not None:
                 # Stockage de la perte pour la distribution
                 self.loss_history.append(loss.item())
-                
+
                 # Calcul du temps écoulé
                 elapsed_hours = (time.time() - self.training_start_time) / 3600
-                
+
                 # Log des métriques
                 metrics = {
                     "training/loss": loss.item(),
                     "training/elapsed_hours": elapsed_hours,
                 }
-                
+
                 # Ajout de la distribution des pertes tous les 100 steps
                 if self.state.global_step % 100 == 0 and self.loss_history:
-                    metrics["training/loss_distribution"] = wandb.Histogram(self.loss_history)
-                    self.loss_history = self.loss_history[-1000:]  # Garder les 1000 dernières valeurs
-                
+                    metrics["training/loss_distribution"] = wandb.Histogram(
+                        self.loss_history
+                    )
+                    self.loss_history = self.loss_history[
+                        -1000:
+                    ]  # Garder les 1000 dernières valeurs
+
                 wandb.log(metrics, step=self.state.global_step)
 
             return loss
@@ -378,15 +382,30 @@ class TrainingConfig:
         batch_scale = (effective_batch_size / 256) ** 0.5
         learning_rate = base_lr * batch_scale
 
-        # Calcul des steps d'entraînement
-        tokens_per_batch = (
-            base_batch_size * 512
-        )  # 512 est la longueur max de séquence pour CamemBERT
-        total_batches = self.data_loader.dataset_size // tokens_per_batch
-        total_steps = int(total_batches // gradient_acc)
+        # Calcul des steps d'entraînement avec la nouvelle approche
+        tokens_per_step = (
+            base_batch_size * gradient_acc * 512
+        )  # Nombre de tokens traités par step
+        min_steps = 25000  # Minimum de steps souhaité, 100K dans CamemBERT, limité en ressources donc réduit
+
+        # Calcul du nombre de steps de base pour couvrir le dataset
+        base_steps = max(1, self.data_loader.dataset_size // tokens_per_step)
+
+        # Application d'un multiplicateur pour atteindre le minimum de steps
+        steps_multiplier = max(1, min_steps // base_steps)
+        total_steps = base_steps * steps_multiplier
+
+        # On s'assure d'avoir au moins le minimum de steps
+        total_steps = max(total_steps, min_steps)
+
+        # Application d'une limite supérieure raisonnable
+        total_steps = min(total_steps, 100000)  # Maximum comme dans le papier
 
         # Warmup steps (6% comme dans CamemBERT original)
         warmup_steps = int(0.06 * total_steps)
+
+        # Estimation du nombre de passages sur le dataset (epochs virtuels)
+        virtual_epochs = (total_steps * tokens_per_step) / self.data_loader.dataset_size
 
         # Configuration finale
         training_args = {
@@ -411,7 +430,7 @@ class TrainingConfig:
             else "🖥️ CPU (Test Local)"
         )
 
-        # Message détaillé pour le logging
+        # Message détaillé pour le logging avec informations supplémentaires
         log_message = (
             f"Configuration optimisée pour {dataset_size_gb:.1f}GB sur {hardware_info}:\n"
             f"- Batch Size: {base_batch_size} (95% GPU utilization)\n"
@@ -421,6 +440,8 @@ class TrainingConfig:
             f"- Total Steps: {total_steps:,}\n"
             f"- Warmup Steps: {warmup_steps:,}\n"
             f"- Workers: {optimal_workers}\n"
+            f"- Virtual Epochs: {virtual_epochs:.1f}\n"
+            f"- Tokens per Step: {tokens_per_step:,}\n"
             f"- Scheduler: Polynomial decay"
         )
 
@@ -428,8 +449,10 @@ class TrainingConfig:
             "training_args": training_args,
             "info": {
                 "dataset_size_gb": dataset_size_gb,
-                "total_batches": total_batches,
+                "base_steps": base_steps,
+                "virtual_epochs": virtual_epochs,
                 "effective_batch_size": effective_batch_size,
+                "tokens_per_step": tokens_per_step,
                 "gpu_memory": gpu_memory_gb if torch.cuda.is_available() else 0,
                 "estimated_hours": total_steps * (2.5 / 3600),
             },
@@ -522,7 +545,6 @@ class TrainingConfig:
             if wandb.run is not None:
                 wandb.finish()
             return f"❌ Training error: {str(e)}"
-
 
     def stop_training(self):
         """Arrête l'entraînement et nettoie"""
