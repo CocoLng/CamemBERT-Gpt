@@ -253,18 +253,10 @@ class TrainingConfig:
             raise
 
     def _calculate_training_parameters(self) -> dict:
-        """Calculate training parameters following CamemBERT paper specifications.
+        """Calculate training parameters adapted from CamemBERT to single GPU setup
         
-        Returns:
-            dict: Training arguments and information
-        
-        Paper settings:
-        - Batch size: 8192 sequences
-        - Max sequence length: 512 tokens
-        - Adam optimizer with β1=0.9, β2=0.98
-        - Learning rate peaks at 0.0007
-        - Warm-up over first 10k steps
-        - Total training for 100k steps
+        Original paper: 256 V100 GPUs (32GB)
+        Our setup: 1 GPU (48GB)
         """
         if not self.data_loader or not self.data_loader.dataset_size:
             raise ValueError("Dataset not initialized")
@@ -272,28 +264,27 @@ class TrainingConfig:
         model_args = self.model_config.model_args
         dataset_size_gb = self.data_loader.dataset_size * 4 / (1024**3)
 
-        # Fixed parameters from CamemBERT paper
+        # Fixed parameters optimized for 1 GPU
         total_steps = 100_000
         warmup_steps = 10_000
-        target_batch_size = 8192
-        learning_rate = 0.0007  
-        
-        # GPU configuration
+        learning_rate = 0.0007
+
+        # GPU configuration 
         if torch.cuda.is_available():
             gpu_props = torch.cuda.get_device_properties(0)
             gpu_memory_gb = gpu_props.total_memory / (1024**3)
-            base_batch_size = 64  # Optimal batch size for GPU utilization
+            base_batch_size = 78  # Optimized for 48GB GPU
+            gradient_acc = 4      # Reduced accumulation steps
             optimal_workers = min(4, os.cpu_count() or 1)
             hardware_info = f"🚀 GPU ({gpu_props.name}, {gpu_memory_gb:.1f}GB VRAM)"
         else:
             base_batch_size = 16
+            gradient_acc = 4
             optimal_workers = 1
             hardware_info = "🖥️ CPU (Test Local)"
 
-        # Calculate gradient accumulation to reach target batch size
-        gradient_acc = target_batch_size // base_batch_size
+        effective_batch_size = base_batch_size * gradient_acc
         
-        # Prepare training arguments
         training_args = {
             "max_steps": total_steps,
             "warmup_steps": warmup_steps,
@@ -309,33 +300,30 @@ class TrainingConfig:
             "logging_steps": max(10, total_steps // 100),
         }
 
-        # Calculate training statistics
         tokens_per_step = base_batch_size * gradient_acc * 512
-        estimated_epochs = (total_steps * tokens_per_step) / self.data_loader.dataset_size
+        estimated_hours = total_steps * (2.5 / 3600)  # Estimation basée sur les mesures actuelles
 
-        # Prepare logging message
         log_message = (
             f"Training configuration for {dataset_size_gb:.1f}GB on {hardware_info}:\n"
             f"- Base Batch Size: {base_batch_size}\n"
             f"- Gradient Accumulation: {gradient_acc}\n"
-            f"- Effective Batch Size: {target_batch_size}\n"
+            f"- Effective Batch Size: {effective_batch_size}\n"
             f"- Learning Rate: {learning_rate:.2e}\n"
             f"- Training Steps: {total_steps:,}\n"
             f"- Warmup Steps: {warmup_steps:,}\n"
-            f"- Workers: {optimal_workers}\n"
             f"- Tokens per Step: {tokens_per_step:,}\n"
-            f"- Estimated Epochs: {estimated_epochs:.2f}\n"
-            f"- Scheduler: Polynomial decay"
+            f"- Estimated Hours: {estimated_hours:.1f}\n"
+            f"- Schedule: Polynomial decay"
         )
 
         return {
             "training_args": training_args,
             "info": {
                 "dataset_size_gb": dataset_size_gb,
-                "effective_batch_size": target_batch_size,
+                "effective_batch_size": effective_batch_size,
                 "tokens_per_step": tokens_per_step,
                 "gpu_memory": gpu_memory_gb if torch.cuda.is_available() else 0,
-                "estimated_epochs": estimated_epochs,
+                "estimated_hours": estimated_hours,
             },
             "log_message": log_message,
         }
