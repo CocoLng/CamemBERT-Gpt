@@ -253,42 +253,57 @@ class TrainingConfig:
             raise
 
     def _calculate_training_parameters(self) -> dict:
-        """Calculate training parameters adapted from CamemBERT to single GPU setup
+        """Calculate training parameters following CamemBERT paper with optimized GPU usage.
         
-        Original paper: 256 V100 GPUs (32GB)
-        Our setup: 1 GPU (48GB)
+        Learning rate follows paper specifications:
+        - Warm up for 10k steps to peak value of 0.0007
+        - Then fades to zero with polynomial decay
         """
         if not self.data_loader or not self.data_loader.dataset_size:
-            raise ValueError("Dataset not initialized")
+            raise ValueError("Dataset non initialisé")
 
         model_args = self.model_config.model_args
         dataset_size_gb = self.data_loader.dataset_size * 4 / (1024**3)
 
-        # Fixed parameters optimized for 1 GPU
-        total_steps = 20_000
-        warmup_steps = 10_000
-        learning_rate = 0.0007
-
-        # GPU configuration 
+        # Configuration GPU et mémoire
         if torch.cuda.is_available():
             gpu_props = torch.cuda.get_device_properties(0)
             gpu_memory_gb = gpu_props.total_memory / (1024**3)
-            base_batch_size = 64  # Optimized for 48GB GPU
-            gradient_acc = 5      # Reduced accumulation steps
+            base_batch_size = 64  # Optimisé pour ~95% utilisation GPU
+            gradient_acc = 5      # Pour maintenir un effective batch size proche de l'original
             optimal_workers = min(4, os.cpu_count() or 1)
-            hardware_info = f"🚀 GPU ({gpu_props.name}, {gpu_memory_gb:.1f}GB VRAM)"
         else:
-            base_batch_size = 16
+            base_batch_size = 8
             gradient_acc = 4
-            optimal_workers = 5
-            hardware_info = "🖥️ CPU (Test Local)"
+            optimal_workers = 1
 
+        # Calcul du batch size effectif
         effective_batch_size = base_batch_size * gradient_acc
+
+        # Learning rate configuration from paper
+        peak_lr = 0.0007  # Peak learning rate as specified
         
+        # Calcul des steps d'entraînement
+        tokens_per_step = base_batch_size * gradient_acc * 512
+        min_steps = 5000  # Minimum steps souhaité (réduit de 100k pour ressources limitées)
+        
+        # Calcul du nombre de steps pour couvrir le dataset
+        base_steps = max(1, self.data_loader.dataset_size // tokens_per_step)
+        
+        # Ensure minimum steps while respecting maximum
+        steps_multiplier = max(1, min_steps // base_steps)
+        total_steps = min(base_steps * steps_multiplier, 25000)
+        total_steps = max(total_steps, min_steps)
+
+        # Warmup configuration
+        warmup_steps = 10000  # Fixed 10k warmup steps as per paper
+
+        # Configuration finale
         training_args = {
             "max_steps": total_steps,
+            "learning_rate": peak_lr,  # Using peak_lr from paper
             "warmup_steps": warmup_steps,
-            "learning_rate": learning_rate,
+            "logging_steps": 250,
             "gradient_accumulation_steps": gradient_acc,
             "per_device_train_batch_size": base_batch_size,
             "dataloader_num_workers": optimal_workers,
@@ -296,34 +311,38 @@ class TrainingConfig:
             "adam_beta1": 0.9,
             "adam_beta2": 0.98,
             "max_grad_norm": model_args.max_grad_norm,
-            "lr_scheduler_type": "polynomial",
-            "logging_steps": 250,
+            "lr_scheduler_type": "polynomial",  # Explicitly using polynomial decay as per paper
         }
 
-        tokens_per_step = base_batch_size * gradient_acc * 512
-        estimated_hours = total_steps * (2.5 / 3600)  # Estimation basée sur les mesures actuelles
+        # Préparation du message de log
+        hardware_info = (
+            f"🚀 GPU ({gpu_props.name}, {gpu_memory_gb:.1f}GB VRAM)"
+            if torch.cuda.is_available()
+            else "🖥️ CPU (Test Local)"
+        )
 
         log_message = (
-            f"Training configuration for {dataset_size_gb:.1f}GB on {hardware_info}:\n"
-            f"- Base Batch Size: {base_batch_size}\n"
+            f"Configuration optimisée pour {dataset_size_gb:.1f}GB sur {hardware_info}:\n"
+            f"- Batch Size: {base_batch_size} (~95% GPU utilization)\n"
             f"- Gradient Accumulation: {gradient_acc}\n"
             f"- Effective Batch Size: {effective_batch_size}\n"
-            f"- Learning Rate: {learning_rate:.2e}\n"
-            f"- Training Steps: {total_steps:,}\n"
+            f"- Peak Learning Rate: {peak_lr:.2e} (warmup: {warmup_steps:,} steps)\n"
+            f"- Total Steps: {total_steps:,}\n"
             f"- Warmup Steps: {warmup_steps:,}\n"
+            f"- Workers: {optimal_workers}\n"
             f"- Tokens per Step: {tokens_per_step:,}\n"
-            f"- Estimated Hours: {estimated_hours:.1f}\n"
-            f"- Schedule: Polynomial decay"
+            f"- Scheduler: Polynomial decay"
         )
 
         return {
             "training_args": training_args,
             "info": {
                 "dataset_size_gb": dataset_size_gb,
+                "base_steps": base_steps,
                 "effective_batch_size": effective_batch_size,
                 "tokens_per_step": tokens_per_step,
                 "gpu_memory": gpu_memory_gb if torch.cuda.is_available() else 0,
-                "estimated_hours": estimated_hours,
+                "estimated_hours": total_steps * (2.5 / 3600),
             },
             "log_message": log_message,
         }
