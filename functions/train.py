@@ -265,7 +265,7 @@ class TrainingConfig:
         dataset_size_gb = self.data_loader.dataset_size * 4 / (1024**3)
 
         # Fixed parameters optimized for 1 GPU
-        total_steps = 100_000
+        total_steps = 20_000
         warmup_steps = 10_000
         learning_rate = 0.0007
 
@@ -273,14 +273,14 @@ class TrainingConfig:
         if torch.cuda.is_available():
             gpu_props = torch.cuda.get_device_properties(0)
             gpu_memory_gb = gpu_props.total_memory / (1024**3)
-            base_batch_size = 78  # Optimized for 48GB GPU
-            gradient_acc = 4      # Reduced accumulation steps
+            base_batch_size = 64  # Optimized for 48GB GPU
+            gradient_acc = 5      # Reduced accumulation steps
             optimal_workers = min(4, os.cpu_count() or 1)
             hardware_info = f"🚀 GPU ({gpu_props.name}, {gpu_memory_gb:.1f}GB VRAM)"
         else:
             base_batch_size = 16
             gradient_acc = 4
-            optimal_workers = 1
+            optimal_workers = 5
             hardware_info = "🖥️ CPU (Test Local)"
 
         effective_batch_size = base_batch_size * gradient_acc
@@ -297,7 +297,7 @@ class TrainingConfig:
             "adam_beta2": 0.98,
             "max_grad_norm": model_args.max_grad_norm,
             "lr_scheduler_type": "polynomial",
-            "logging_steps": max(10, total_steps // 100),
+            "logging_steps": 250,
         }
 
         tokens_per_step = base_batch_size * gradient_acc * 512
