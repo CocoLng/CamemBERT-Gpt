@@ -1,5 +1,4 @@
 import logging
-import math
 import os
 import sys
 
@@ -253,17 +252,14 @@ class TrainingConfig:
             raise
 
     def _calculate_training_parameters(self) -> dict:
-        """Calculate training parameters following CamemBERT paper with optimized GPU usage.
-        
-        Learning rate follows paper specifications:
-        - Warm up for 10k steps to peak value of 0.0007
-        - Then fades to zero with polynomial decay
-        """
+        """Calcule les paramètres d'entraînement en fonction de la taille du dataset."""
         if not self.data_loader or not self.data_loader.dataset_size:
             raise ValueError("Dataset non initialisé")
 
         model_args = self.model_config.model_args
-        dataset_size_gb = self.data_loader.dataset_size * 4 / (1024**3)
+
+        # Utilise la taille du dataset en tokens
+        total_tokens = self.data_loader.dataset_size
 
         # Configuration GPU et mémoire
         if torch.cuda.is_available():
@@ -280,28 +276,28 @@ class TrainingConfig:
         # Calcul du batch size effectif
         effective_batch_size = base_batch_size * gradient_acc
 
-        # Learning rate configuration from paper
-        peak_lr = 0.0007  # Peak learning rate as specified
-        
-        # Calcul des steps d'entraînement
-        tokens_per_step = base_batch_size * gradient_acc * 512
-        min_steps = 5000  # Minimum steps souhaité (réduit de 100k pour ressources limitées)
-        
-        # Calcul du nombre de steps pour couvrir le dataset
-        base_steps = max(1, self.data_loader.dataset_size // tokens_per_step)
-        
-        # Ensure minimum steps while respecting maximum
-        steps_multiplier = max(1, min_steps // base_steps)
-        total_steps = min(base_steps * steps_multiplier, 25000)
-        total_steps = max(total_steps, min_steps)
+        peak_lr = 0.0007
 
-        # Warmup configuration
-        warmup_steps = 10000  # Fixed 10k warmup steps as per paper
+        # Calcul du nombre de tokens par step
+        tokens_per_step = effective_batch_size * 512  # 512 tokens par séquence
 
-        # Configuration finale
+        # Calcul du nombre total de steps pour couvrir le dataset
+        base_steps = max(1, total_tokens // tokens_per_step)
+
+        # S'assure d'avoir un minimum de steps
+        min_steps = 5000
+        total_steps = max(base_steps, min_steps)
+
+        # Limite le nombre total de steps à une valeur maximale si nécessaire
+        total_steps = min(total_steps, 25000)
+
+        # Configuration du warmup
+        warmup_steps = min(10000, total_steps // 10)  # Par exemple, 10% des steps totaux
+
+        # Configuration finale des arguments d'entraînement
         training_args = {
             "max_steps": total_steps,
-            "learning_rate": peak_lr,  # Using peak_lr from paper
+            "learning_rate": peak_lr,  # Défini précédemment
             "warmup_steps": warmup_steps,
             "logging_steps": 250,
             "gradient_accumulation_steps": gradient_acc,
@@ -322,7 +318,7 @@ class TrainingConfig:
         )
 
         log_message = (
-            f"Configuration optimisée pour {dataset_size_gb:.1f}GB sur {hardware_info}:\n"
+            f"Configuration optimisée pour {hardware_info}:\n"
             f"- Batch Size: {base_batch_size} (~95% GPU utilization)\n"
             f"- Gradient Accumulation: {gradient_acc}\n"
             f"- Effective Batch Size: {effective_batch_size}\n"
@@ -337,7 +333,7 @@ class TrainingConfig:
         return {
             "training_args": training_args,
             "info": {
-                "dataset_size_gb": dataset_size_gb,
+                "total_tokens": total_tokens,
                 "base_steps": base_steps,
                 "effective_batch_size": effective_batch_size,
                 "tokens_per_step": tokens_per_step,
