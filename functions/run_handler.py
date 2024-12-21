@@ -94,9 +94,9 @@ class Run_Handler:
                 with gr.Row():
                     with gr.Column():
                         vocab_size = gr.Slider(
-                            minimum=50265,
-                            maximum=100630,
-                            value=50265,
+                            minimum=32000,
+                            maximum=50265,
+                            value=32000,
                             step=1000,
                             label="Taille du Vocabulaire (vocab_size)",
                             info="Défaut RoBERTa: 50265",

@@ -10,7 +10,7 @@ from .masking_monitor import (
     MaskingHandler,
     MaskingMonitorCallback,
 )
-from .training_saver import TrainingSaver  
+from .training_saver import TrainingSaver
 
 
 class CustomTrainer(TrainingSaver, Trainer):
@@ -52,7 +52,7 @@ class CustomTrainer(TrainingSaver, Trainer):
             self._save_model_info(self.run_dir)
 
     def training_step(self, model, inputs, return_loss=True):
-        """Étape d'entraînement avec surveillance et performance optimales."""
+        """Étape d'entraînement avec surveillance et graphiques améliorés"""
         try:
             required_keys = {"input_ids", "attention_mask", "labels"}
             if not all(k in inputs for k in required_keys):
@@ -64,7 +64,7 @@ class CustomTrainer(TrainingSaver, Trainer):
             tokens_in_batch = inputs["input_ids"].size(0) * inputs["input_ids"].size(1)
             self.tokens_processed += tokens_in_batch
 
-            # Initial logging (vraiment une seule fois)
+            # Initial logging
             if self.state.global_step == 0 and not self._initial_log_done:
                 target_size = self.dataset_size if self.dataset_size else "unknown"
                 dataset_name = (
@@ -87,13 +87,13 @@ class CustomTrainer(TrainingSaver, Trainer):
                 self.logger.warning(
                     f"Non-finite loss detected at step {self.state.global_step}: {loss.item()}"
                 )
-                if self.state.global_step > 0:  
+                if self.state.global_step > 0:
                     raise ValueError("Training stopped due to non-finite loss")
             if (
                 self.state.global_step > 0
                 and self.state.global_step % self.checkpoint_steps == 0
             ):
-                self._save_checkpoint(self.state.global_step)
+                self.save_checkpoint(self.state.global_step)
 
             return loss
 
@@ -101,37 +101,9 @@ class CustomTrainer(TrainingSaver, Trainer):
             self.logger.error(f"Error in training step: {e}")
             raise
 
-    def _save_checkpoint(self, step):
-        """Nouveau helper pour gérer la sauvegarde des checkpoints"""
-        checkpoint_path = os.path.join(self.checkpoints_dir, f"checkpoint-{step}")
-
-        if not os.path.exists(checkpoint_path):
-            os.makedirs(checkpoint_path, exist_ok=True)
-
-            # Sauvegarder le modèle et le tokenizer une seule fois
-            self.model.save_pretrained(checkpoint_path)
-            if self.processing_class is not None:
-                self.processing_class.save_pretrained(checkpoint_path)
-                self.logger.info(f"Tokenizer saved to {checkpoint_path}")
-
-            # Sauvegarder l'état d'entraînement
-            training_state = {
-                "global_step": self.state.global_step,
-                "tokens_processed": self.tokens_processed,
-                "target_size": self.dataset_size,
-                "log_history": self.state.log_history,
-                "best_model_checkpoint": self.state.best_model_checkpoint,
-                "training_time": self.state.total_flos,
-                "epoch": self.state.epoch,
-            }
-            torch.save(
-                training_state, os.path.join(checkpoint_path, "trainer_state.pt")
-            )
-
-            # Sauvegarder les métriques
-            self._save_metrics_report(checkpoint_path)
-
-            self.logger.info(f"Checkpoint saved to {checkpoint_path}")
+    def _save_checkpoint(self, model=None, trial=None, metrics=None):
+        """Surcharge de la méthode Trainer pour assurer la compatibilité"""
+        self.save_checkpoint(self.state.global_step, metrics=metrics)
 
 
 class TrainingConfig:
@@ -141,12 +113,10 @@ class TrainingConfig:
         self.logger = logging.getLogger(__name__)
         self.model_config = model_config
         self.data_loader = data_loader
-        self.masking_handler = MaskingHandler(data_loader)  
+        self.masking_handler = MaskingHandler(data_loader)
         self.trainer = None
         self.model = None
-        self.tokenizer = (
-            data_loader.tokenizer
-        )  
+        self.tokenizer = data_loader.tokenizer
 
         # Setup des répertoires
         self.base_dir = "camembert-training"
@@ -219,9 +189,7 @@ class TrainingConfig:
                 )
 
             # Vérifier que le collate_fn fonctionne
-            test_batch = self.masking_handler.data_collator(
-                [sample_batch]
-            ) 
+            test_batch = self.masking_handler.data_collator([sample_batch])
             required_batch_fields = {"input_ids", "attention_mask", "labels"}
 
             if not all(k in test_batch for k in required_batch_fields):
@@ -235,7 +203,7 @@ class TrainingConfig:
 
             masking_monitor = MaskingMonitorCallback(
                 tokenizer=self.tokenizer,
-                expected_mlm_probability=self.masking_handler.mlm_probability,  
+                expected_mlm_probability=self.masking_handler.mlm_probability,
             )
 
             # Utiliser directement le dataset configuré
@@ -244,10 +212,10 @@ class TrainingConfig:
                 model=self.model,
                 args=training_args,
                 train_dataset=self.data_loader.dataset,
-                data_collator=self.masking_handler.data_collator,  
+                data_collator=self.masking_handler.data_collator,
                 callbacks=[masking_monitor],
                 processing_class=self.tokenizer,
-                masking_handler=self.masking_handler,  
+                masking_handler=self.masking_handler,
             )
 
             # Garder la vérification finale
@@ -262,9 +230,7 @@ class TrainingConfig:
         try:
             # Test batch processing
             sample_batch = next(iter(self.data_loader.dataset))
-            test_batch = self.masking_handler.data_collator(
-                [sample_batch]
-            ) 
+            test_batch = self.masking_handler.data_collator([sample_batch])
 
             # Verification des champs requis
             required_keys = {"input_ids", "attention_mask", "labels"}
@@ -286,63 +252,54 @@ class TrainingConfig:
             raise
 
     def _calculate_training_parameters(self) -> dict:
-        """Calcule les paramètres d'entraînement en utilisant les valeurs de model_config"""
+        """Calcule les paramètres d'entraînement en fonction de la taille du dataset."""
         if not self.data_loader or not self.data_loader.dataset_size:
             raise ValueError("Dataset non initialisé")
 
         model_args = self.model_config.model_args
 
-        cuda_available = torch.cuda.is_available()
-        base_batch_size = model_args.batch_size if cuda_available else 16
-        optimal_workers = 4 if cuda_available else 2
+        # Utilise la taille du dataset en tokens
+        total_tokens = self.data_loader.dataset_size
 
-        # Dataset Size Analysis
-        dataset_size_gb = self.data_loader.dataset_size * 4 / (1024**3)
+        # Configuration GPU et mémoire
+        if torch.cuda.is_available():
+            gpu_props = torch.cuda.get_device_properties(0)
+            gpu_memory_gb = gpu_props.total_memory / (1024**3)
+            base_batch_size = 64  # Optimisé pour ~95% utilisation GPU
+            gradient_acc = 5      # Pour maintenir un effective batch size proche de l'original
+            optimal_workers = min(4, os.cpu_count() or 1)
+        else:
+            base_batch_size = 8
+            gradient_acc = 4
+            optimal_workers = 1
 
-        # Calcul du learning rate et du batch size
-        gradient_acc = 16  
-        if dataset_size_gb < 5:
-            gradient_acc = 8
-        elif dataset_size_gb < 20:
-            gradient_acc = 12
-
+        # Calcul du batch size effectif
         effective_batch_size = base_batch_size * gradient_acc
 
-        base_lr = model_args.learning_rate
-        batch_scale = (effective_batch_size / 256) ** 0.5
-        learning_rate = base_lr * batch_scale
+        peak_lr = 0.0007
 
-        # Calcul du nombre de batches et steps
-        tokens_per_batch = base_batch_size * 512
-        total_batches = self.data_loader.dataset_size // tokens_per_batch
+        # Calcul du nombre de tokens par step
+        tokens_per_step = effective_batch_size * 512  # 512 tokens par séquence
 
-        # Calcul du nombre d'updates par heure (dans les log)
-        updates_per_hour = 3600 / (2.5 * (effective_batch_size / 256))
-        total_steps = int(total_batches // gradient_acc)
+        # Calcul du nombre total de steps pour couvrir le dataset
+        base_steps = max(1, total_tokens // tokens_per_step)
 
-        # Warmup steps
-        warmup_steps = int(model_args.warmup_ratio * total_steps)
+        # S'assure d'avoir un minimum de steps
+        min_steps = 5000
+        total_steps = max(base_steps, min_steps)
 
-        # Affichage de l'état de l'entraînement dans les logs
-        save_interval_hours = 1.0 if dataset_size_gb < 20 else 2.0
-        save_steps = max(100, int(updates_per_hour * save_interval_hours))
-        save_steps = min(save_steps, total_steps // 20)
-        save_steps = max(save_steps, total_steps // 100)
+        # Limite le nombre total de steps à une valeur maximale si nécessaire
+        total_steps = min(total_steps, 25000)
 
-        logging_steps = save_steps // 4
+        # Configuration du warmup
+        warmup_steps = min(10000, total_steps // 10)  # Par exemple, 10% des steps totaux
 
-        # Affichage de l'information hardware
-        if cuda_available:
-            gpu_info = torch.cuda.get_device_properties(0)
-            hardware_info = f"🚀 GPU ({gpu_info.name}, {gpu_info.total_memory / (1024**3):.1f}GB VRAM)"
-        else:
-            hardware_info = "🖥️ CPU (Test Local)"
-
+        # Configuration finale des arguments d'entraînement
         training_args = {
             "max_steps": total_steps,
-            "learning_rate": learning_rate,
+            "learning_rate": peak_lr,  # Défini précédemment
             "warmup_steps": warmup_steps,
-            "logging_steps": logging_steps,
+            "logging_steps": 250,
             "gradient_accumulation_steps": gradient_acc,
             "per_device_train_batch_size": base_batch_size,
             "dataloader_num_workers": optimal_workers,
@@ -350,29 +307,38 @@ class TrainingConfig:
             "adam_beta1": 0.9,
             "adam_beta2": 0.98,
             "max_grad_norm": model_args.max_grad_norm,
-            "lr_scheduler_type": "cosine_with_restarts",
+            "lr_scheduler_type": "polynomial",  # Explicitly using polynomial decay as per paper
         }
 
+        # Préparation du message de log
+        hardware_info = (
+            f"🚀 GPU ({gpu_props.name}, {gpu_memory_gb:.1f}GB VRAM)"
+            if torch.cuda.is_available()
+            else "🖥️ CPU (Test Local)"
+        )
+
         log_message = (
-            f"Configuration optimisée pour {dataset_size_gb:.1f}GB sur {hardware_info}:\n"
-            f"- Batches totaux: {total_batches:,}\n"
-            f"- Steps maximum: {total_steps:,}\n"
-            f"- Learning rate: {learning_rate:.2e}\n"
-            f"- Gradient accumulation: {gradient_acc}\n"
-            f"- Batch size: {base_batch_size} (effectif: {effective_batch_size})\n"
-            f"- Nombre de workers: {optimal_workers}\n"
-            f"- Warmup steps: {warmup_steps:,}\n"
-            f"- Schedule: Cosine avec restarts"
+            f"Configuration optimisée pour {hardware_info}:\n"
+            f"- Batch Size: {base_batch_size} (~95% GPU utilization)\n"
+            f"- Gradient Accumulation: {gradient_acc}\n"
+            f"- Effective Batch Size: {effective_batch_size}\n"
+            f"- Peak Learning Rate: {peak_lr:.2e} (warmup: {warmup_steps:,} steps)\n"
+            f"- Total Steps: {total_steps:,}\n"
+            f"- Warmup Steps: {warmup_steps:,}\n"
+            f"- Workers: {optimal_workers}\n"
+            f"- Tokens per Step: {tokens_per_step:,}\n"
+            f"- Scheduler: Polynomial decay"
         )
 
         return {
             "training_args": training_args,
             "info": {
-                "dataset_size_gb": dataset_size_gb,
-                "total_batches": total_batches,
+                "total_tokens": total_tokens,
+                "base_steps": base_steps,
                 "effective_batch_size": effective_batch_size,
+                "tokens_per_step": tokens_per_step,
+                "gpu_memory": gpu_memory_gb if torch.cuda.is_available() else 0,
                 "estimated_hours": total_steps * (2.5 / 3600),
-                "hardware_setup": hardware_info,
             },
             "log_message": log_message,
         }
@@ -430,8 +396,10 @@ class TrainingConfig:
                     self.logger.info(
                         "Training reached its target steps. Saving final state..."
                     )
-                    # Sauvegarde finale du modèle
-                    self.trainer.save_model()
+                    # Appel à la méthode fusionnée save_model
+                    self.trainer.save_model()  # Sauvegarde le modèle final
+
+                    self.logger.info("Final model saved successfully")
 
                     # Log des métriques finales dans wandb
                     if wandb.run is not None:
@@ -462,45 +430,6 @@ class TrainingConfig:
                 wandb.finish()
             return f"❌ Training error: {str(e)}"
 
-    def _save_final_model(self):
-        """Sauvegarde le modèle final avec gestion explicite du tokenizer"""
-        try:
-            if not self.trainer:
-                return
-
-            # Sauvegarder d'abord le modèle
-            self.trainer.save_model()
-
-            # Vérifier si wandb est actif
-            if not wandb.run:
-                return
-
-            # Vérifier si c'est vraiment la fin du training
-            training_finished = (
-                self.trainer.state.global_step >= self.trainer.args.max_steps
-            )
-
-            if training_finished:
-                try:
-                    final_metrics = {
-                        "final_loss": self.trainer.state.log_history[-1].get(
-                            "loss", None
-                        ),
-                        "total_steps": self.trainer.state.global_step,
-                        "training_finished": True,
-                    }
-                    wandb.log(final_metrics)
-                except Exception as e:
-                    self.logger.error(f"Error logging final metrics: {e}")
-                finally:
-                    wandb.finish()
-
-        except Exception as e:
-            self.logger.error(f"Error in _save_final_model: {e}")
-            if wandb.run:
-                wandb.finish()
-            raise
-
     def stop_training(self):
         """Arrête l'entraînement et nettoie"""
         try:
@@ -510,7 +439,7 @@ class TrainingConfig:
             if wandb.run is not None:
                 wandb.finish()
             if self.trainer:
-                self.trainer.save_model()
+                self.trainer.save_model()  # Utilise la méthode save_model fusionnée
 
             self.logger.info("Training stopped successfully!")
 

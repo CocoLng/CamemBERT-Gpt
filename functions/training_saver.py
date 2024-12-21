@@ -1,6 +1,5 @@
 import logging
 import os
-import sys
 from typing import Optional
 
 import torch
@@ -74,13 +73,6 @@ class TrainingSaver:
             self.logger.error(f"Error saving model info: {e}")
             return
 
-    def _save_comprehensive_checkpoint(self, checkpoint_dir: str):
-        """Cette méthode ne devrait plus être appelée directement, utiliser _save_checkpoint à la place"""
-        self.logger.warning(
-            "_save_comprehensive_checkpoint is deprecated, use _save_checkpoint instead"
-        )
-        return
-
     def _save_metrics_report(self, checkpoint_dir: str):
         """Sauvegarde un rapport détaillé des métriques."""
         try:
@@ -114,31 +106,6 @@ class TrainingSaver:
         except Exception as e:
             self.logger.error(f"Error saving metrics report: {e}")
 
-    def save_model(
-        self, output_dir: Optional[str] = None, _internal_call: bool = False
-    ):
-        """Sauvegarde le modèle avec gestion améliorée des poids finaux."""
-        try:
-            save_dir = output_dir if output_dir else self.weights_dir
-            os.makedirs(save_dir, exist_ok=True)
-
-            # Sauvegarder le modèle et le tokenizer
-            self.model.save_pretrained(save_dir)
-            if self.processing_class is not None:
-                self.processing_class.save_pretrained(save_dir)
-            self._save_model_info(self.run_dir)
-
-            # Sauvegarder les métriques finales si nécessaire
-            if not _internal_call:
-                metrics_path = os.path.join(save_dir, "final_metrics.json")
-                self._save_final_metrics(metrics_path)
-
-            self.logger.info(f"Model and associated files saved to {save_dir}")
-
-        except Exception as e:
-            self.logger.error(f"Error saving model: {e}")
-            raise
-
     def _save_final_metrics(self, metrics_path: str):
         """Sauvegarde les métriques finales d'entraînement."""
         final_metrics = {
@@ -156,48 +123,81 @@ class TrainingSaver:
 
         torch.save(final_metrics, metrics_path)
 
-    def _save_final_model(self):
-        """Sauvegarde le modèle final avec gestion explicite du tokenizer."""
+    def save_model(self, output_dir: Optional[str] = None):
+        """Sauvegarde le modèle final, le tokenizer et les informations associées."""
         try:
-            if not self.trainer:
-                self.logger.error("Trainer non initialisé")
-                return
+            save_dir = output_dir if output_dir else self.weights_dir
+            os.makedirs(save_dir, exist_ok=True)
 
-            # Sauvegarder d'abord le modèle
-            self.trainer.save_model()
+            # Sauvegarde du modèle
+            self.logger.info("Saving final model...")
+            self.model.save_pretrained(save_dir, safe_serialization=True)
 
-            # Vérifier si wandb est actif
-            if not wandb.run:
-                self.logger.warning("WandB non initialisé")
+            # Sauvegarde du tokenizer ou de la classe de traitement
+            if hasattr(self, "tokenizer"):
+                self.logger.info("Saving tokenizer...")
+                self.tokenizer.save_pretrained(save_dir)
+            elif self.processing_class is not None:
+                self.logger.info("Saving processing class...")
+                self.processing_class.save_pretrained(save_dir)
+            else:
+                self.logger.warning("No tokenizer or processing class found to save")
 
-            # Vérifier si c'est vraiment la fin du training
-            training_finished = (
-                self.trainer.state.global_step >= self.trainer.args.max_steps
-            )
+            # Sauvegarder les informations du modèle
+            self._save_model_info(self.run_dir)
 
-            if training_finished:
-                self.logger.info("Entraînement terminé, modèle final sauvegardé.")
+            # Sauvegarde des métriques finales
+            metrics_path = os.path.join(save_dir, "final_metrics.json")
+            self._save_final_metrics(metrics_path)
+                
+            self.logger.info(f"Final model and tokenizer saved in {save_dir}")
+
+            # Synchronisation avec wandb si actif
+            if wandb.run:
+                self.logger.info("Syncing with wandb...")
+                wandb.save(os.path.join(save_dir, "*"))
 
         except Exception as e:
-            self.logger.error(f"Error in _save_final_model: {e}")
+            self.logger.error(f"Error saving model: {e}")
             if wandb.run:
                 wandb.finish()
             raise
 
-    def stop_training(self):
-        """Arrête l'entraînement et nettoie."""
+    def save_checkpoint(self, step, metrics=None):
+        """Sauvegarde un checkpoint du modèle et de l'état d'entraînement."""
         try:
-            self.logger.info("Stopping training...")
+            checkpoint_path = os.path.join(self.checkpoints_dir, f"checkpoint-{step}")
+            os.makedirs(checkpoint_path, exist_ok=True)
 
-            # Cleanup wandb (pour GPU)
-            if wandb.run is not None:
-                wandb.finish()
-            if self.trainer:
-                self._save_final_model()
+            # Sauvegarder le modèle et le tokenizer
+            self.model.save_pretrained(checkpoint_path)
+            if self.processing_class is not None:
+                self.processing_class.save_pretrained(checkpoint_path)
+                self.logger.info(f"Tokenizer saved to {checkpoint_path}")
 
-            self.logger.info("Training stopped successfully!")
+            # Sauvegarder l'état d'entraînement
+            training_state = {
+                "global_step": self.state.global_step,
+                "tokens_processed": self.tokens_processed,
+                "target_size": self.dataset_size,
+                "log_history": self.state.log_history,
+                "best_model_checkpoint": self.state.best_model_checkpoint,
+                "training_time": self.state.total_flos,
+            }
+
+            # Ajouter les métriques si présentes
+            if metrics:
+                training_state["metrics"] = metrics
+
+            torch.save(
+                training_state, os.path.join(checkpoint_path, "trainer_state.pt")
+            )
+
+            # Sauvegarder les métriques
+            self._save_metrics_report(checkpoint_path)
+
+            self.logger.info(f"Checkpoint saved to {checkpoint_path}")
 
         except Exception as e:
-            self.logger.error(f"Error stopping training: {e}")
-            self.logger.exception("Exit failure")
-            sys.exit(1)
+            self.logger.error(f"Error saving checkpoint: {e}")
+            raise

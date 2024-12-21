@@ -126,16 +126,17 @@ class DataLoader:
     def load_dataset(self, size_gb: float) -> bool:
         """Charge le dataset avec une taille spécifiée en GB"""
         try:
-            # Calcule la taille du dataset en tokens
+            # Calcule le nombre total de tokens à charger
             bytes_per_token = 4
             tokens_per_gb = int((1024 * 1024 * 1024) / bytes_per_token)
-            self._dataset_size = int(size_gb * tokens_per_gb)
+            total_tokens = int(size_gb * tokens_per_gb)
+            self._dataset_size = total_tokens
 
             # Calcule le buffer optimal
             optimal_buffer = DatasetConfig.calculate_optimal_buffer(size_gb)
 
             # Charge le dataset en streaming
-            self.dataset = load_dataset(
+            raw_dataset = load_dataset(
                 self.dataset_config.name,
                 name=self.dataset_config.subset,
                 split=self.dataset_config.split,
@@ -143,12 +144,21 @@ class DataLoader:
                 trust_remote_code=True,
             )
 
-            if not self.dataset:
+            if not raw_dataset:
                 raise ValueError(f"Échec du chargement du dataset {self.dataset_config.name}")
 
-            # Configure le pipeline de streaming
-            self.dataset = self.dataset.shuffle(buffer_size=optimal_buffer)
-            self.dataset = self.prepare_dataset(self.dataset)
+            # Estimation du nombre moyen de tokens par exemple après tokenisation
+            average_tokens_per_example = 256  # Vous pouvez ajuster cette valeur si nécessaire
+
+            # Calcule le nombre d'exemples à prendre pour atteindre le total_tokens
+            num_examples = total_tokens // average_tokens_per_example
+
+            # Applique un shuffle et limite le dataset au nombre d'exemples calculé
+            raw_dataset = raw_dataset.shuffle(buffer_size=optimal_buffer)
+            limited_dataset = raw_dataset.take(num_examples)
+
+            # Prépare le dataset limité
+            self.dataset = self.prepare_dataset(limited_dataset)
 
             return True
 
