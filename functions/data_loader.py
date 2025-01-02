@@ -8,6 +8,8 @@ import psutil
 from datasets import Dataset, load_dataset
 from transformers import RobertaTokenizerFast
 
+from .french_tokenizer import FrenchTokenizerTrainer
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
@@ -47,12 +49,23 @@ class DataLoader:
     def __init__(
         self,
         dataset_config: Optional[DatasetConfig] = None,
+        tokenizer_path: Optional[str] = None
     ):
         self.logger = logging.getLogger(__name__)
-        self.tokenizer = self._initialize_tokenizer()
+        self.dataset_config = dataset_config or DatasetConfig()
+        
+        if tokenizer_path:
+            # Utilise un tokenizer existant
+            self.tokenizer = FrenchTokenizerTrainer().load_tokenizer(tokenizer_path)
+        else:
+            # Entraîne un nouveau tokenizer
+            trainer = FrenchTokenizerTrainer()
+            data_file = trainer.prepare_training_data("tokenizer_data")
+            model_path, _ = trainer.train_tokenizer(data_file, "tokenizer")
+            self.tokenizer = trainer.load_tokenizer(model_path)
+            
         self.dataset = None
         self._dataset_size = 0
-        self.dataset_config = dataset_config or DatasetConfig()
 
     def _initialize_tokenizer(self) -> RobertaTokenizerFast:
         """Initialise le tokenizer RoBERTa"""
@@ -63,15 +76,33 @@ class DataLoader:
             raise
 
     def _tokenize_function(self, examples: Dict) -> Dict:
-        """Tokenisation spécifique à RoBERTa avec vérification des types"""
+        """Tokenisation spécifique à CamemBERT avec masquage par mots entiers"""
         try:
             if not isinstance(examples["text"], (str, list)):
                 self.logger.warning(f"Unexpected text type: {type(examples['text'])}")
                 if isinstance(examples["text"], dict) and "text" in examples["text"]:
                     examples["text"] = examples["text"]["text"]
 
+            # Ajout du masquage par mots entiers (WWM)
+            # On utilise les espaces comme délimiteurs de mots
+            words = examples["text"].split()
+            mask_indices = np.random.rand(len(words)) < 0.15
+            
+            for idx in range(len(words)):
+                if mask_indices[idx]:
+                    r = np.random.rand()
+                    if r < 0.8:
+                        words[idx] = "<mask>"
+                    elif r < 0.9:
+                        words[idx] = words[idx]  # Keep unchanged 10% of time
+                    else:
+                        # Random word 10% of time
+                        words[idx] = np.random.choice(words)
+                        
+            masked_text = " ".join(words)
+
             tokenized = self.tokenizer(
-                examples["text"],
+                masked_text,
                 truncation=True,
                 padding="max_length",
                 max_length=512,
@@ -79,10 +110,7 @@ class DataLoader:
                 return_attention_mask=True,
             )
 
-            return {
-                k: list(v) if isinstance(v, (list, np.ndarray)) else v
-                for k, v in tokenized.items()
-            }
+            return tokenized
 
         except Exception as e:
             self.logger.error(f"Tokenization error: {e}", exc_info=True)

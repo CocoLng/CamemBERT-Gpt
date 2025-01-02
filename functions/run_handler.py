@@ -241,6 +241,43 @@ class Run_Handler:
                             label="Statut du chargement", interactive=False
                         )
 
+                gr.Markdown("### Test de Génération de Texte")
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        input_text = gr.Textbox(
+                            label="Texte d'entrée",
+                            placeholder="Entrez un texte en français...",
+                            lines=3,
+                        )
+                        with gr.Row():
+                            num_tokens = gr.Slider(
+                                minimum=1,
+                                maximum=10,
+                                value=5,
+                                step=1,
+                                label="Nombre de tokens à prédire",
+                            )
+                            top_k = gr.Slider(
+                                minimum=1,
+                                maximum=10,
+                                value=5,
+                                step=1,
+                                label="Nombre de prédictions par position (top-k)",
+                            )
+                        predict_btn = gr.Button("Prédire", variant="primary")
+
+                with gr.Row():
+                    with gr.Column():
+                        predicted_text = gr.Markdown(
+                            label="Texte Généré et Contexte",
+                            value="En attente de prédiction...",
+                        )
+                    with gr.Column():
+                        predictions_display = gr.Markdown(
+                            label="Détails des Prédictions",
+                            value="En attente de prédiction...",
+                        )
+
                 # Event handlers
                 model_source.change(
                     fn=lambda source: gr.update(visible=source == "Checkpoint"),
@@ -290,39 +327,6 @@ class Run_Handler:
                     outputs=[model_load_status],
                 )
 
-                gr.Markdown("### Test de Génération de Texte")
-                with gr.Row():
-                    with gr.Column():
-                        input_text = gr.Textbox(
-                            label="Texte d'entrée",
-                            placeholder="Entrez un texte en français...",
-                            lines=3,
-                        )
-                        num_tokens = gr.Slider(
-                            minimum=1,
-                            maximum=10,
-                            value=5,
-                            step=1,
-                            label="Nombre de tokens à prédire",
-                        )
-                        top_k = gr.Slider(
-                            minimum=1,
-                            maximum=10,
-                            value=5,
-                            step=1,
-                            label="Nombre de prédictions par position",
-                        )
-                        predict_btn = gr.Button("Prédire")
-
-                with gr.Row():
-                    with gr.Column():
-                        predicted_text = gr.Textbox(
-                            label="Texte Généré", lines=3, interactive=False
-                        )
-                    with gr.Column():
-                        predictions_display = gr.Textbox(
-                            label="Détails des Prédictions", lines=10, interactive=False
-                        )
 
             with gr.Tab("5. Fine-Tuning"):
                 gr.Markdown("### Chargement du Modèle Pré-entraîné")
@@ -621,15 +625,18 @@ class Run_Handler:
             return f"Erreur lors de la lecture des informations: {str(e)}"
 
     def _load_model_for_testing(self, source: str, folder: str, path: str) -> str:
-        """Charge le modèle pour le test."""
         try:
             if not os.path.exists(path):
                 return f"❌ Chemin non trouvé: {path}"
-
-            # Charger le modèle et le tokenizer
+                
+            # Réutiliser le tokenizer du data_loader
+            tokenizer = self.data_loader.tokenizer
+            if tokenizer is None:
+                return "❌ Tokenizer non initialisé dans le data_loader"
+                
+            # Charger le modèle
             model = RobertaForMaskedLM.from_pretrained(path)
-            tokenizer = RobertaTokenizerFast.from_pretrained(path)
-
+            
             if torch.cuda.is_available():
                 model = model.cuda()
 
