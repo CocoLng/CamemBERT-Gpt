@@ -6,6 +6,8 @@ checkpoints/
 wandb/
 camembert-training/
 
+tokenizer_training_data.txt
+
 # C extensions
 *.so
 .DS_Store

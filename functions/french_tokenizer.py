@@ -6,6 +6,7 @@ from transformers import PreTrainedTokenizerFast
 from datasets import load_dataset
 import numpy as np
 import itertools
+import multiprocessing
 
 class FrenchTokenizerTrainer:
     """Gestionnaire d'entraînement du tokenizer pour le français"""
@@ -28,15 +29,13 @@ class FrenchTokenizerTrainer:
             
             # Échantillonne 10^7 phrases aléatoirement
             self.logger.info("Sampling 10M sentences for tokenizer training...")
-            sampled_texts = []
-            for i, example in enumerate(dataset):
-                if i >= 10_000_000:  # 10^7 phrases
-                    break
-                if isinstance(example["text"], str):
-                    sampled_texts.append(example["text"])
-            sampled_texts = [ex["text"] for ex in itertools.islice(dataset, 10_000_000) if isinstance(ex["text"], str)]
             
-            # Sauvegarde les textes pour l'entraînement
+            def is_valid(example):
+                return isinstance(example["text"], str)
+            
+            sampled_texts = itertools.islice((ex["text"] for ex in dataset if is_valid(ex)), 10_000_000)
+            
+            # Écriture directe sans stocker en mémoire
             output_file = Path(output_path) / "tokenizer_training_data.txt"
             output_file.parent.mkdir(parents=True, exist_ok=True)
             
@@ -54,6 +53,8 @@ class FrenchTokenizerTrainer:
         try:
             model_prefix = str(Path(output_path) / "french_sp")
             
+            cpu_count = multiprocessing.cpu_count()
+            
             # Configuration améliorée de SentencePiece pour CamemBERT
             spm.SentencePieceTrainer.train(
                 input=input_file,
@@ -68,7 +69,7 @@ class FrenchTokenizerTrainer:
                 input_sentence_size=10000000,  # Pour les 10^7 phrases
                 shuffle_input_sentence=True,   # Mélange des phrases
                 train_extremely_large_corpus=True,  # Pour OSCAR
-                num_threads=32
+                num_threads=cpu_count  # Utiliser tous les cœurs disponibles
             )
             
             return model_prefix + ".model", model_prefix + ".vocab"
