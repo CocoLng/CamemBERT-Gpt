@@ -18,6 +18,11 @@ class FrenchTokenizerTrainer:
     def prepare_training_data(self, output_path: str):
         """Prépare les données pour l'entraînement du tokenizer"""
         try:
+            output_file = Path(output_path) / "tokenizer_training_data.txt"
+            if output_file.exists():
+                self.logger.info("Fichier de données d'entraînement existant trouvé. Chargement direct.")
+                return str(output_file)
+            
             # Charge le dataset OSCAR français en streaming
             dataset = load_dataset(
                 "oscar",
@@ -36,7 +41,6 @@ class FrenchTokenizerTrainer:
             sampled_texts = itertools.islice((ex["text"] for ex in dataset if is_valid(ex)), 10_000_000)
             
             # Écriture directe sans stocker en mémoire
-            output_file = Path(output_path) / "tokenizer_training_data.txt"
             output_file.parent.mkdir(parents=True, exist_ok=True)
             
             with output_file.open("w", encoding="utf-8") as f:
