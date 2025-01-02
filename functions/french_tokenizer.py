@@ -5,6 +5,7 @@ import sentencepiece as spm
 from transformers import PreTrainedTokenizerFast
 from datasets import load_dataset
 import numpy as np
+import itertools
 
 class FrenchTokenizerTrainer:
     """Gestionnaire d'entraînement du tokenizer pour le français"""
@@ -21,7 +22,8 @@ class FrenchTokenizerTrainer:
                 "oscar",
                 "unshuffled_deduplicated_fr",
                 streaming=True,
-                split="train"
+                split="train",
+                trust_remote_code=True
             )
             
             # Échantillonne 10^7 phrases aléatoirement
@@ -32,6 +34,7 @@ class FrenchTokenizerTrainer:
                     break
                 if isinstance(example["text"], str):
                     sampled_texts.append(example["text"])
+            sampled_texts = [ex["text"] for ex in itertools.islice(dataset, 10_000_000) if isinstance(ex["text"], str)]
             
             # Sauvegarde les textes pour l'entraînement
             output_file = Path(output_path) / "tokenizer_training_data.txt"
@@ -65,7 +68,7 @@ class FrenchTokenizerTrainer:
                 input_sentence_size=10000000,  # Pour les 10^7 phrases
                 shuffle_input_sentence=True,   # Mélange des phrases
                 train_extremely_large_corpus=True,  # Pour OSCAR
-                num_threads=16  # Parallélisation
+                num_threads=32
             )
             
             return model_prefix + ".model", model_prefix + ".vocab"
