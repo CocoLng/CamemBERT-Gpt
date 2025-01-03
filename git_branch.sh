@@ -11,7 +11,7 @@ if [ $? -eq 0 ]; then
     echo "La branche '$branch_name' existe déjà. Passage à cette branche."
     git checkout "$branch_name"
 else
-    echo "La branche '$branch_name' n'existe pas. Création de la branche."
+    echo "La branche '$branch_name' n'existe pas. creation de la branche."
     git checkout -b "$branch_name"
 fi
 
