@@ -1,12 +1,10 @@
 from huggingface_hub import hf_hub_download
 from transformers import AutoModelForSequenceClassification
 from transformers import AutoConfig
-from transformers import AutoTokenizer
 from transformers import PreTrainedTokenizerFast
 from transformers import CamembertTokenizer
 from safetensors.torch import load_file
 from datasets import load_dataset
-import os
 import logging
 from transformers import Trainer, TrainingArguments
 import torch
