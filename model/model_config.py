@@ -131,7 +131,7 @@ class ModelConfig:
                 if not run_handler.data_loader.is_ready():
                     return "❌ Erreur: Veuillez d'abord charger le dataset", ""
 
-                from .train import TrainingConfig
+                from ..process.train import TrainingConfig
 
                 run_handler.training_config = TrainingConfig(
                     self, run_handler.data_loader

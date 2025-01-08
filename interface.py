@@ -6,12 +6,12 @@ import gradio as gr
 import torch
 from transformers import RobertaForMaskedLM, RobertaTokenizerFast
 
-from functions.data_loader import DataLoader, DatasetConfig
-from functions.fine_tuning import Finetune_NLI
-from functions.fine_tuning_saver import FineTuningSaver  
-from functions.masking_monitor import MaskingHandler 
-from functions.model_config import ModelConfig
-from functions.test_predictor import TestPredictor
+from data.data_loader import DataLoader, DatasetConfig
+from process.fine_tuning import Finetune_NLI
+from process.fine_tuning_saver import FineTuningSaver  
+from data.masking_monitor import MaskingHandler 
+from model.model_config import ModelConfig
+from model.test_predictor import TestPredictor
 
 # Appélé depuis le fichier main.py
 
@@ -424,9 +424,9 @@ class Run_Handler:
                         )
                         batch_size = gr.Slider(
                             minimum=4,
-                            maximum=32,
+                            maximum=64,
                             value=8,
-                            step=4,
+                            step=8,
                             label="Taille des Batchs"
                         )
                         learning_rate = gr.Slider(
