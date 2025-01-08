@@ -6,7 +6,7 @@ import torch
 import wandb
 from transformers import RobertaForMaskedLM, Trainer, TrainingArguments
 
-from .masking_monitor import (
+from ..data.masking_monitor import (
     MaskingHandler,
     MaskingMonitorCallback,
 )
