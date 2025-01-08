@@ -1,0 +1,11 @@
+transformers
+datasets
+torch
+sentencepiece
+gradio
+psutil
+numpy
+pandas
+scikit-learn
+seaborn
+matplotlib
