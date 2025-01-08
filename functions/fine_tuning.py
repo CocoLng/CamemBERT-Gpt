@@ -1,29 +1,25 @@
 import logging
 import os
-
-from typing import Tuple
+from typing import Tuple, Dict, Union, Any
 import numpy as np
 from sklearn.metrics import confusion_matrix
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
-
-import torch.nn as nn
-from datasets import load_dataset
-from huggingface_hub import hf_hub_download
-from safetensors.torch import load_file
+import torch
+from torch import nn
 from transformers import (
     AutoConfig,
     AutoModel,
     CamembertTokenizer,
     Trainer,
     TrainingArguments,
+    RobertaForMaskedLM,
 )
-
-from .training_saver import TrainingSaver
+from datasets import load_dataset
+from .fine_tuning_saver import FineTuningSaver
 
 logger = logging.getLogger(__name__)
-
 
 class CustomNLIModel(nn.Module):
     """Custom model with a classification head for NLI tasks."""
@@ -66,38 +62,98 @@ class CustomNLIModel(nn.Module):
         return logits if loss is None else (loss, logits)
 
 
-class CustomNLITrainer(TrainingSaver, Trainer):
-    """Custom trainer that integrates TrainingSaver functionality."""
-
-    def __init__(self, checkpoint_steps=1000, **kwargs):
+class CustomNLITrainer(Trainer):
+    def __init__(self, checkpoint_steps=1000, saver=None, **kwargs):
+        # Remove tokenizer from kwargs if present to avoid deprecation warning
+        if 'tokenizer' in kwargs:
+            del kwargs['tokenizer']
+        super().__init__(**kwargs)
         self.checkpoint_steps = checkpoint_steps
         self.tokens_processed = 0
+        self.saver = saver
+        
+        # Initialize saver if not provided
+        if self.saver is None:
+            try:
+                output_dir = kwargs.get("args", TrainingArguments("default")).output_dir
+                self.saver = FineTuningSaver(run_dir=output_dir)
+            except Exception as e:
+                logger.error(f"Failed to initialize saver: {e}")
+                self.saver = None
+        
+    def training_step(
+        self, 
+        model: nn.Module, 
+        inputs: Dict[str, Union[torch.Tensor, Any]], 
+        return_loss=True
+    ) -> torch.Tensor:
+        """Override training step with checkpoint handling."""
+        # Call parent's training step with all arguments
+        loss = super().training_step(model, inputs, return_loss)
+        
+        if self.state.global_step > 0 and self.state.global_step % self.checkpoint_steps == 0:
+            if self.saver:
+                try:
+                    metrics = self.evaluate()
+                    self.saver.save_nli_checkpoint(self.state.global_step, metrics)
+                    # Cleanup old checkpoints
+                    self.saver.cleanup_old_checkpoints(max_checkpoints=5)
+                except Exception as e:
+                    logger.error(f"Failed to save checkpoint at step {self.state.global_step}: {e}")
+                    self._emergency_save(model)
+        
+        return loss
+    
+    def _emergency_save(self, model):
+        """Emergency save in case of checkpoint failure."""
+        try:
+            emergency_dir = os.path.join(self.args.output_dir, "emergency_backup")
+            os.makedirs(emergency_dir, exist_ok=True)
+            model.save_pretrained(emergency_dir)
+            logger.info(f"Emergency backup saved to {emergency_dir}")
+        except Exception as e:
+            logger.critical(f"Emergency save failed: {e}")
 
-        # Initialize TrainingSaver with NLI-specific paths
-        TrainingSaver.__init__(
-            self,
-            run_dir=kwargs["args"].output_dir,
-            dataset_size=kwargs.get("dataset_size", 0),
-            processing_class=kwargs.get("tokenizer", None),
-        )
 
-        # Initialize the Trainer
-        Trainer.__init__(self, **kwargs)
-
-        # Save initial model info
-        if hasattr(self, "model") and self.model is not None:
-            self._save_model_info(self.run_dir)
+    def save_model(self, output_dir=None):
+        """Override save_model to add extra safety checks."""
+        try:
+            # Save with parent method
+            super().save_model(output_dir)
+            
+            # Verify saved files
+            if output_dir is None:
+                output_dir = self.args.output_dir
+                
+            required_files = ['config.json', 'pytorch_model.bin']
+            missing_files = [f for f in required_files 
+                           if not os.path.exists(os.path.join(output_dir, f))]
+            
+            if missing_files:
+                raise ValueError(f"Missing required files after save: {missing_files}")
+                
+            # Save evaluation metrics
+            if hasattr(self, 'eval_metrics'):
+                self.saver.save_evaluation_metrics(self.eval_metrics)
+                
+        except Exception as e:
+            self.logger.error(f"Error during model saving: {e}")
+            # Try to save to backup location
+            backup_dir = os.path.join(output_dir, 'backup')
+            os.makedirs(backup_dir, exist_ok=True)
+            super().save_model(backup_dir)
+            raise
 
 
 class Finetune_NLI:
     """Fine-tune an NLI model for Natural Language Inference tasks."""
-    def __init__(self, model_repo, weights_filename, config_filename, voca_filename, tokenizer_name="camembert-base"):
+    def __init__(self, model_repo=None, weights_filename=None, config_filename=None, voca_filename=None, base_dir="camembert-nli"):
         self.logger = logging.getLogger(__name__)
         self.model_repo = model_repo
         self.voca_filename = voca_filename
         self.weights_filename = weights_filename
         self.config_filename = config_filename
-        self.tokenizer_name = tokenizer_name
+        self.tokenizer_name = "camembert-base"
         self.tokenizer = CamembertTokenizer.from_pretrained(self.tokenizer_name)
         self.model = None
         self.config = None
@@ -105,17 +161,32 @@ class Finetune_NLI:
         self.test_dataset = None
         self.val_dataset = None
         self.trainer = None
+        
+        self.base_dir = base_dir
+        self.run_dir = self._setup_run_dir() 
+        self.saver = FineTuningSaver(run_dir=self.run_dir)
 
     def _setup_run_dir(self) -> str:
-        """Create and configure the run directory."""
-        os.makedirs(self.base_dir, exist_ok=True)
-        run_id = 0
-        while True:
-            run_dir = os.path.join(self.base_dir, f"nli_run{run_id}")
-            if not os.path.exists(run_dir):
-                os.makedirs(run_dir)
-                return run_dir
-            run_id += 1
+        """Create and setup the run directory with proper error handling."""
+        try:
+            os.makedirs(self.base_dir, exist_ok=True)
+            run_id = 0
+            while True:
+                run_dir = os.path.join(self.base_dir, f"nli_run{run_id}")
+                if not os.path.exists(run_dir):
+                    os.makedirs(run_dir)
+                    # Create required subdirectories
+                    for subdir in ['checkpoints', 'weights', 'logs', 'metrics']:
+                        os.makedirs(os.path.join(run_dir, subdir), exist_ok=True)
+                    return run_dir
+                run_id += 1
+        except Exception as e:
+            logger.error(f"Failed to setup run directory: {e}")
+            # Fallback to timestamp-based directory
+            import time
+            fallback_dir = os.path.join(self.base_dir, f"nli_run_{int(time.time())}")
+            os.makedirs(fallback_dir, exist_ok=True)
+            return fallback_dir
 
     def load_data(self, dataset_name="facebook/xnli", language="fr", test_split=0.2):
         """Load and tokenize the dataset for NLI tasks."""
@@ -142,90 +213,91 @@ class Finetune_NLI:
 
         return train_dataset, test_dataset, validation_dataset
 
-    def finetune_model(
-        self,
-        train_dataset,
-        test_dataset,
-        validation_dataset,
-        num_epochs=1,
-        batch=8,
-        learning_rate=1e-5,
-        num_labels=3,
-    ):
-        """Fine-tune the NLI model using CustomNLITrainer."""
-        logger.info("Loading model configuration and weights...")
-
-        # Download weights and config
-        weights_path = hf_hub_download(self.model_repo, self.weights_filename)
-        config_path = hf_hub_download(self.model_repo, self.config_filename)
-
-        # Load config and weights
-        self.config = AutoConfig.from_pretrained(config_path)
-        weights = load_file(weights_path)
-
-        # Initialize the custom model
-        self.model = CustomNLIModel(self.config, weights, num_labels)
-
-        # Define training arguments with proper directories
-        training_args = TrainingArguments(
-            output_dir=self.run_dir,
-            evaluation_strategy="epoch",
-            save_strategy="epoch",
-            num_train_epochs=num_epochs,
-            per_device_train_batch_size=batch,
-            per_device_eval_batch_size=8,
-            learning_rate=learning_rate,
-            logging_dir=os.path.join(self.run_dir, "logs"),
-            logging_steps=1,
-            report_to="tensorboard",
-            save_total_limit=2,
-            load_best_model_at_end=True,
-        )
-
-        # Initialize CustomNLITrainer
-        logger.info("Initializing Trainer...")
-        trainer = CustomNLITrainer(
-            model=self.model,
-            args=training_args,
-            train_dataset=train_dataset,
-            eval_dataset=validation_dataset,
-            tokenizer=self.tokenizer,
-            dataset_size=len(train_dataset),
-        )
-
-        # Fine-tune the model
-        logger.info("Starting training...")
-        trainer.train()
-
-        # Evaluate and save results
-        logger.info("Evaluating model...")
-        results = trainer.evaluate(validation_dataset)
-
-        # Save the final model and results
-        save_dir = os.path.join(self.run_dir, "final_model")
-        os.makedirs(save_dir, exist_ok=True)
-
-        trainer.save_model()
-        logger.info(f"Model saved to {save_dir}")
-
-        return trainer, results
-    
-    def initialize_model(self, model_repo: str, weights_path: str, config_path: str, tokenizer_name: str) -> str:
-        """Initialize the model with given parameters."""
+    def finetune_model(self, train_dataset, test_dataset, validation_dataset, 
+                    num_epochs=1, batch=8, learning_rate=1e-5, num_labels=3):
+        """Fine-tune with proper directory handling and save validation."""
+        if not hasattr(self, 'run_dir') or not os.path.exists(self.run_dir):
+            self.run_dir = self._setup_run_dir()
+            
         try:
-            self.model_repo = model_repo
-            self.weights_filename = weights_path
-            self.config_filename = config_path
-            self.tokenizer_name = tokenizer_name
+            if not all([self.config, self.model]):
+                raise ValueError("Model and config must be initialized first")
+                
+            # Initialize model
+            model = CustomNLIModel(self.config, self.model.state_dict(), num_labels)
             
-            # Update tokenizer if needed
-            if self.tokenizer_name != tokenizer_name:
-                self.tokenizer = CamembertTokenizer.from_pretrained(tokenizer_name)
+            # Training arguments with updated parameter names
+            training_args = TrainingArguments(
+                output_dir=self.run_dir,
+                eval_strategy="epoch",  # Updated from evaluation_strategy
+                save_strategy="epoch",
+                num_train_epochs=num_epochs,
+                per_device_train_batch_size=batch,
+                per_device_eval_batch_size=8,
+                learning_rate=learning_rate,
+                logging_dir=os.path.join(self.run_dir, "logs"),
+                logging_steps=1,
+                report_to="tensorboard",
+                save_total_limit=2,
+                load_best_model_at_end=True,
+                metric_for_best_model="eval_loss",
+                greater_is_better=False
+            )
             
-            return "✅ Configuration du modèle mise à jour avec succès"
+            # Initialize trainer without tokenizer parameter
+            trainer = CustomNLITrainer(
+                model=model,
+                args=training_args,
+                train_dataset=train_dataset,
+                eval_dataset=validation_dataset,
+                saver=self.saver
+            )
+            
+            return trainer, trainer.train()
+            
         except Exception as e:
-            self.logger.error(f"Error initializing model: {e}")
-            return f"❌ Erreur lors de l'initialisation: {str(e)}"
+            logger.error(f"Error in finetune_model: {str(e)}")
+            raise
+        
+    def initialize_model(self, model_repo: str, weights_path: str, config_path: str, tokenizer_name: str = "camembert-base") -> str:
+        """Initialize model from local files."""
+        try:
+            # Construction des chemins complets en incluant camembert-training
+            base_dir = "camembert-training"
+            weights_full_path = os.path.join(base_dir, model_repo, weights_path)
+            config_full_path = os.path.join(base_dir, model_repo, config_path)
+            
+            # Vérification des fichiers
+            if not os.path.exists(weights_full_path):
+                return f"❌ Fichier de poids non trouvé: {weights_full_path}"
+            if not os.path.exists(config_full_path):
+                return f"❌ Fichier de configuration non trouvé: {config_full_path}"
+                
+            # Chargement du tokenizer (toujours depuis camembert-base)
+            try:
+                self.tokenizer = CamembertTokenizer.from_pretrained(tokenizer_name)
+                self.logger.info(f"Loaded tokenizer: {tokenizer_name}")
+            except Exception as e:
+                return f"❌ Erreur lors du chargement du tokenizer: {str(e)}"
+            
+            # Chargement du modèle local
+            try:
+                self.config = AutoConfig.from_pretrained(config_full_path)
+                self.model = RobertaForMaskedLM.from_pretrained(
+                    weights_full_path,
+                    config=self.config
+                )
+                
+                self.logger.info(f"Successfully loaded model from {weights_full_path}")
+                return "✅ Modèle chargé avec succès"
+                
+            except Exception as e:
+                self.logger.error(f"Error loading model: {e}")
+                return f"❌ Erreur lors du chargement du modèle: {str(e)}"
+                
+        except Exception as e:
+            self.logger.error(f"Unexpected error: {e}")
+            return f"❌ Erreur inattendue: {str(e)}"
 
     def prepare_dataset(self, dataset_name: str, language: str, test_split: float) -> Tuple[str, pd.DataFrame]:
         """Prepare the dataset and return status and preview."""
@@ -233,7 +305,6 @@ class Finetune_NLI:
             self.train_dataset, self.test_dataset, self.val_dataset = \
                 self.load_data(dataset_name, language, test_split)
             
-            # Create preview DataFrame
             preview = {
                 'Split': ['Train', 'Test', 'Validation'],
                 'Size': [

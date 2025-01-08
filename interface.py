@@ -26,17 +26,12 @@ class Run_Handler:
         self.base_dir = "camembert-training"
         self.nli_dir = "camembert-nli"
         
-        # Initialize both fine_tuning and fine_tuning_saver
-        self.fine_tuning = Finetune_NLI(
-            model_repo=None,
-            weights_filename=None,
-            config_filename=None,
-            voca_filename=None
-        )
-        self.fine_tuning_saver = FineTuningSaver(run_dir=self.nli_dir)
-        
         # Create necessary directories
         os.makedirs(self.nli_dir, exist_ok=True)
+        
+        # Initialize both fine_tuning and fine_tuning_saver
+        self.fine_tuning = Finetune_NLI(base_dir=self.nli_dir)  
+        self.fine_tuning_saver = FineTuningSaver(run_dir=self.nli_dir)
 
     def create_interface(self) -> gr.Blocks:
         """Create the Gradio interface"""
@@ -338,20 +333,25 @@ class Run_Handler:
                 gr.Markdown("### Configuration du Modèle Pré-entraîné")
                 with gr.Row():
                     with gr.Column():
-                        model_repo = gr.Textbox(
-                            value="camembert-base",
-                            label="Repository du modèle"
+                        model_repo = gr.Dropdown(
+                            label="Dossier du modèle",
+                            choices=self._get_run_directories(),  # Réutilise la fonction de la partie 4
+                            interactive=True,
+                            value=None,
+                            info="Sélectionner le dossier du modèle dans camembert-training/ (ex: cam_run24)"
                         )
                         weights_path = gr.Textbox(
                             label="Chemin des poids",
-                            value="weights/model.safetensors"
-                        )
-                        config_path = gr.Textbox(
-                            label="Chemin de la configuration",
-                            value="weights/config.json"
+                            value="weights/model.safetensors",
+                            info="Chemin relatif depuis le dossier du modèle"
                         )
                     
                     with gr.Column():
+                        config_path = gr.Textbox(
+                            label="Chemin de la configuration",
+                            value="weights/config.json",
+                            info="Chemin relatif depuis le dossier du modèle"
+                        )
                         tokenizer_name = gr.Textbox(
                             value="camembert-base",
                             label="Nom du tokenizer"
@@ -361,6 +361,25 @@ class Run_Handler:
                             label="Statut du Modèle",
                             interactive=False
                         )
+
+                    # Rafraîchir la liste des runs
+                    refresh_runs = gr.Button("🔄 Rafraîchir")
+                    refresh_runs.click(
+                        fn=lambda: gr.Dropdown(choices=self._get_run_directories()),
+                        outputs=[model_repo]
+                    )
+
+                    # Chargement du modèle
+                    load_model_btn.click(
+                        fn=self.fine_tuning.initialize_model,
+                        inputs=[
+                            model_repo,
+                            weights_path,
+                            config_path,
+                            tokenizer_name
+                        ],
+                        outputs=[model_status]
+                    )
 
                 gr.Markdown("### Configuration du Dataset NLI")
                 with gr.Row():
@@ -643,7 +662,7 @@ class Run_Handler:
             if not os.path.exists(path):
                 return f"❌ Chemin non trouvé: {path}"
                 
-            # Utiliser CamemBERT tokenizer
+            # Charger le tokenizer
             from transformers import CamembertTokenizerFast
             tokenizer = CamembertTokenizerFast.from_pretrained("camembert-base")
             
