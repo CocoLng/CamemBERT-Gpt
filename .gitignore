@@ -5,6 +5,9 @@ __pycache__/
 checkpoints/
 wandb/
 camembert-training/
+camembert-nli/
+
+tokenizer_training_data.txt
 
 # C extensions
 *.so

@@ -6,27 +6,37 @@ import gradio as gr
 import torch
 from transformers import RobertaForMaskedLM, RobertaTokenizerFast
 
-from .data_loader import DataLoader, DatasetConfig
-from .fine_tuning import FineTuning
-from .masking_monitor import MaskingHandler 
-from .model_config import ModelConfig
-from .test_predictor import TestPredictor
+from functions.data_loader import DataLoader, DatasetConfig
+from functions.fine_tuning import Finetune_NLI
+from functions.fine_tuning_saver import FineTuningSaver  
+from functions.masking_monitor import MaskingHandler 
+from functions.model_config import ModelConfig
+from functions.test_predictor import TestPredictor
 
+# Appélé depuis le fichier main.py
 
 class Run_Handler:
     def __init__(self):
         self.logger = logging.getLogger(__name__)
-        self.data_loader = DataLoader(
-            dataset_config=DatasetConfig()
-        ) 
+        self.data_loader = DataLoader(dataset_config=DatasetConfig())
         self.model_config = ModelConfig()
         self.training_config = None
         self.test_predictor = None
-        self.fine_tuning = FineTuning()
-        self.masking_handler = MaskingHandler(
-            self.data_loader
-        )  
+        self.masking_handler = MaskingHandler(self.data_loader)
         self.base_dir = "camembert-training"
+        self.nli_dir = "camembert-nli"
+        
+        # Initialize both fine_tuning and fine_tuning_saver
+        self.fine_tuning = Finetune_NLI(
+            model_repo=None,
+            weights_filename=None,
+            config_filename=None,
+            voca_filename=None
+        )
+        self.fine_tuning_saver = FineTuningSaver(run_dir=self.nli_dir)
+        
+        # Create necessary directories
+        os.makedirs(self.nli_dir, exist_ok=True)
 
     def create_interface(self) -> gr.Blocks:
         """Create the Gradio interface"""
@@ -96,10 +106,10 @@ class Run_Handler:
                         vocab_size = gr.Slider(
                             minimum=32000,
                             maximum=50265,
-                            value=32000,
+                            value=50265,
                             step=1000,
                             label="Taille du Vocabulaire (vocab_size)",
-                            info="Défaut RoBERTa: 50265",
+                            info="Choix article: 50265",
                         )
                         hidden_size = gr.Slider(
                             minimum=128,
@@ -107,7 +117,7 @@ class Run_Handler:
                             value=768,
                             step=128,
                             label="Dimension des Embeddings (hidden_size)",
-                            info="Défaut RoBERTa: 768",
+                            info="Choix article: 768",
                         )
                         num_attention_heads = gr.Slider(
                             minimum=4,
@@ -115,7 +125,7 @@ class Run_Handler:
                             value=12,
                             step=2,
                             label="Nombre de Têtes d'Attention (num_attention_heads)",
-                            info="Défaut RoBERTa: 12",
+                            info="Choix article: 12",
                         )
 
                     with gr.Column():
@@ -125,7 +135,7 @@ class Run_Handler:
                             value=12,
                             step=2,
                             label="Nombre de Couches (num_hidden_layers)",
-                            info="Défaut RoBERTa: 12",
+                            info="Choix article: 12",
                         )
                         intermediate_size = gr.Slider(
                             minimum=1024,
@@ -133,7 +143,7 @@ class Run_Handler:
                             value=3072,
                             step=256,
                             label="Taille des Couches Intermédiaires (intermediate_size)",
-                            info="Défaut RoBERTa: 3072",
+                            info="Choix article: 3072",
                         )
                         hidden_dropout_prob = gr.Slider(
                             minimum=0.0,
@@ -141,7 +151,7 @@ class Run_Handler:
                             value=0.1,
                             step=0.05,
                             label="Dropout (hidden_dropout_prob)",
-                            info="Défaut RoBERTa: 0.1",
+                            info="Choix article: 0.1",
                         )
                         attention_probs_dropout_prob = gr.Slider(
                             minimum=0.0,
@@ -149,7 +159,7 @@ class Run_Handler:
                             value=0.1,
                             step=0.05,
                             label="Attention Dropout (attention_probs_dropout_prob)",
-                            info="Défaut RoBERTa: 0.1",
+                            info="Choix article: 0.1",
                         )
 
                 with gr.Row():
@@ -324,92 +334,162 @@ class Run_Handler:
                             label="Détails des Prédictions", lines=10, interactive=False
                         )
 
-            with gr.Tab("5. Fine-Tuning"):
-                gr.Markdown("### Chargement du Modèle Pré-entraîné")
+            with gr.Tab("5. Fine-Tuning NLI"):
+                gr.Markdown("### Configuration du Modèle Pré-entraîné")
                 with gr.Row():
                     with gr.Column():
-                        ft_model_source = gr.Radio(
-                            choices=["Checkpoint Local", "Modèle HuggingFace"],
-                            label="Source du modèle",
-                            value="Checkpoint Local",
+                        model_repo = gr.Textbox(
+                            value="camembert-base",
+                            label="Repository du modèle"
                         )
-                        ft_available_runs = gr.Dropdown(
-                            label="Runs disponibles",
-                            choices=self._get_run_directories(),
-                            interactive=True,
-                            visible=True,
+                        weights_path = gr.Textbox(
+                            label="Chemin des poids",
+                            value="weights/model.safetensors"
                         )
-                        ft_checkpoints = gr.Dropdown(
-                            label="Checkpoints disponibles",
-                            choices=[],
-                            interactive=True,
-                            visible=True,
+                        config_path = gr.Textbox(
+                            label="Chemin de la configuration",
+                            value="weights/config.json"
                         )
-                        ft_hf_model = gr.Textbox(
-                            label="Nom du modèle HuggingFace",
-                            placeholder="ex: camembert-base",
-                            visible=False,
+                    
+                    with gr.Column():
+                        tokenizer_name = gr.Textbox(
+                            value="camembert-base",
+                            label="Nom du tokenizer"
                         )
-                        refresh_ft_runs = gr.Button("Rafraîchir les runs")
-                        load_ft_model = gr.Button("Charger le modèle")
-                        ft_model_status = gr.Textbox(
-                            label="Statut du chargement", interactive=False
+                        load_model_btn = gr.Button("Charger le Modèle")
+                        model_status = gr.Textbox(
+                            label="Statut du Modèle",
+                            interactive=False
                         )
 
-                gr.Markdown("### Configuration du Fine-tuning")
+                gr.Markdown("### Configuration du Dataset NLI")
                 with gr.Row():
                     with gr.Column():
-                        ft_dataset = gr.Dropdown(
-                            choices=list(FineTuning.AVAILABLE_DATASETS.keys()),
-                            label="Dataset",
-                            value="multi_nli",
+                        dataset_name = gr.Textbox(
+                            value="facebook/xnli",
+                            label="Nom du Dataset"
                         )
-                        prepare_dataset = gr.Button("Préparer le Dataset")
-                        dataset_status = gr.Textbox(
-                            label="Statut de la préparation", interactive=False
+                        language = gr.Dropdown(
+                            choices=["fr", "en", "es"],
+                            value="fr",
+                            label="Langue"
+                        )
+                        test_split = gr.Slider(
+                            minimum=0.1,
+                            maximum=0.4,
+                            value=0.2,
+                            step=0.05,
+                            label="Proportion Test Set"
+                        )
+                    
+                    with gr.Column():
+                        prepare_data_btn = gr.Button("Préparer les Données")
+                        data_status = gr.Textbox(
+                            label="Statut des Données",
+                            interactive=False
+                        )
+                        dataset_info = gr.DataFrame(
+                            label="Aperçu du Dataset",
+                            interactive=False
                         )
 
+                gr.Markdown("### Configuration de l'Entraînement")
+                with gr.Row():
                     with gr.Column():
-                        ft_learning_rate = gr.Slider(
-                            minimum=1e-5,
-                            maximum=1e-4,
-                            value=2e-5,
-                            step=1e-5,
-                            label="Learning Rate",
-                        )
-                        ft_epochs = gr.Slider(
+                        num_epochs = gr.Slider(
                             minimum=1,
                             maximum=10,
                             value=3,
                             step=1,
-                            label="Nombre d'Epochs",
+                            label="Nombre d'Epochs"
                         )
-                        ft_batch_size = gr.Slider(
-                            minimum=16,
-                            maximum=80,
-                            value=80,
-                            step=8,
-                            label="Taille des Batchs",
+                        batch_size = gr.Slider(
+                            minimum=4,
+                            maximum=32,
+                            value=8,
+                            step=4,
+                            label="Taille des Batchs"
                         )
-                        ft_wandb_project = gr.Textbox(
-                            value="camembert-fine-tuning", label="Nom du Projet W&B"
+                        learning_rate = gr.Slider(
+                            minimum=1e-6,
+                            maximum=1e-4,
+                            value=1e-5,
+                            step=1e-6,
+                            label="Learning Rate"
+                        )
+                        num_labels = gr.Slider(
+                            minimum=2,
+                            maximum=5,
+                            value=3,
+                            step=1,
+                            label="Nombre de Classes"
+                        )
+
+                    with gr.Column():
+                        save_dir = gr.Textbox(
+                            value="camembert-nli",
+                            label="Dossier de Sauvegarde"
+                        )
+                        use_tensorboard = gr.Checkbox(
+                            value=True,
+                            label="Utiliser TensorBoard"
                         )
 
                 with gr.Row():
-                    start_ft_button = gr.Button("Démarrer le Fine-tuning")
-                    ft_status = gr.Textbox(
-                        label="Statut du Fine-tuning", interactive=False
+                    start_ft_btn = gr.Button("Démarrer le Fine-tuning")
+                    stop_ft_btn = gr.Button("Arrêter le Fine-tuning")
+                    training_status = gr.Textbox(
+                        label="Statut de l'Entraînement",
+                        interactive=False
                     )
 
-                gr.Markdown("### Évaluation du Modèle")
+                gr.Markdown("### Évaluation et Métriques")
                 with gr.Row():
-                    evaluate_button = gr.Button("Évaluer le Modèle")
-                    evaluation_status = gr.Textbox(
-                        label="Résultats de l'Évaluation", interactive=False
-                    )
-                    confusion_matrix = gr.Image(
-                        label="Matrice de Confusion", interactive=False
-                    )
+                    with gr.Column():
+                        evaluate_btn = gr.Button("Évaluer le Modèle")
+                        metrics_display = gr.DataFrame(
+                            label="Métriques d'Évaluation",
+                            interactive=False
+                        )
+                    with gr.Column():
+                        confusion_matrix = gr.Plot(
+                            label="Matrice de Confusion"
+                        )
+                        accuracy_plot = gr.Plot(
+                            label="Courbe d'Apprentissage"
+                        )
+
+                # Event Handlers
+                load_model_btn.click(
+                    fn=self.fine_tuning.initialize_model,
+                    inputs=[model_repo, weights_path, config_path, tokenizer_name],
+                    outputs=[model_status]
+                )
+
+                prepare_data_btn.click(
+                    fn=self.fine_tuning.prepare_dataset,
+                    inputs=[dataset_name, language, test_split],
+                    outputs=[data_status, dataset_info]
+                )
+
+                start_ft_btn.click(
+                    fn=self.fine_tuning.start_training,
+                    inputs=[
+                        num_epochs, batch_size, learning_rate, num_labels,
+                        save_dir, use_tensorboard
+                    ],
+                    outputs=[training_status]
+                )
+
+                stop_ft_btn.click(
+                    fn=self.fine_tuning.stop_training,
+                    outputs=[training_status]
+                )
+
+                evaluate_btn.click(
+                    fn=self.fine_tuning.evaluate_model,
+                    outputs=[metrics_display, confusion_matrix, accuracy_plot]
+                )
 
             # Event Handlers
             load_btn.click(
@@ -486,69 +566,7 @@ class Run_Handler:
                 inputs=[input_text, num_tokens, top_k],
                 outputs=[predicted_text, predictions_display],
             )
-
-            # Event handlers pour le fine-tuning
-            ft_model_source.change(
-                fn=lambda source: (
-                    [
-                        gr.update(visible=source == "Checkpoint Local"),
-                        gr.update(visible=source == "Checkpoint Local"),
-                        gr.update(visible=source == "Modèle HuggingFace"),
-                    ]
-                ),
-                inputs=[ft_model_source],
-                outputs=[ft_available_runs, ft_checkpoints, ft_hf_model],
-            )
-
-            refresh_ft_runs.click(
-                fn=lambda: self._get_run_directories(), outputs=[ft_available_runs]
-            )
-
-            ft_available_runs.change(
-                fn=self._get_available_checkpoints,
-                inputs=[ft_available_runs],
-                outputs=[ft_checkpoints],
-            )
-
-            load_ft_model.click(
-                fn=lambda source,
-                runs,
-                checkpoint,
-                hf_model: self.fine_tuning.load_model_for_fine_tuning(
-                    source, runs, checkpoint, hf_model
-                ),
-                inputs=[
-                    ft_model_source,
-                    ft_available_runs,
-                    ft_checkpoints,
-                    ft_hf_model,
-                ],
-                outputs=[ft_model_status],
-            )
-
-            prepare_dataset.click(
-                fn=lambda dataset: self.fine_tuning.prepare_dataset(dataset),
-                inputs=[ft_dataset],
-                outputs=[dataset_status],
-            )
-
-            start_ft_button.click(
-                fn=lambda *args: self.fine_tuning.start_fine_tuning(*args),
-                inputs=[
-                    ft_wandb_project,
-                    ft_learning_rate,
-                    ft_epochs,
-                    ft_batch_size,
-                    ft_wandb_project,
-                ],
-                outputs=[ft_status],
-            )
-
-            evaluate_button.click(
-                fn=lambda: self.fine_tuning.evaluate_model(),
-                outputs=[evaluation_status, confusion_matrix],
-            )
-
+            
             return interface
 
     def _get_run_directories(self) -> List[str]:
@@ -621,15 +639,17 @@ class Run_Handler:
             return f"Erreur lors de la lecture des informations: {str(e)}"
 
     def _load_model_for_testing(self, source: str, folder: str, path: str) -> str:
-        """Charge le modèle pour le test."""
         try:
             if not os.path.exists(path):
                 return f"❌ Chemin non trouvé: {path}"
-
-            # Charger le modèle et le tokenizer
+                
+            # Utiliser CamemBERT tokenizer
+            from transformers import CamembertTokenizerFast
+            tokenizer = CamembertTokenizerFast.from_pretrained("camembert-base")
+            
+            # Charger le modèle
             model = RobertaForMaskedLM.from_pretrained(path)
-            tokenizer = RobertaTokenizerFast.from_pretrained(path)
-
+            
             if torch.cuda.is_available():
                 model = model.cuda()
 
