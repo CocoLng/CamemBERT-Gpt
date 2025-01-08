@@ -1,10 +1,8 @@
 import logging
-from typing import Optional
 from pathlib import Path
 import sentencepiece as spm
 from transformers import PreTrainedTokenizerFast
 from datasets import load_dataset
-import numpy as np
 import itertools
 import multiprocessing
 
@@ -40,10 +38,10 @@ class FrenchTokenizerTrainer:
             
             sampled_texts = itertools.islice((ex["text"] for ex in dataset if is_valid(ex)), 10_000_000)
             
-            # Écriture directe sans stocker en mémoire
+            # Écriture directe sans stocker en mémoire avec un buffer plus grand
             output_file.parent.mkdir(parents=True, exist_ok=True)
             
-            with output_file.open("w", encoding="utf-8") as f:
+            with output_file.open("w", encoding="utf-8", buffering=1024*1024) as f:  # Buffer de 1MB
                 for text in sampled_texts:
                     f.write(text + "\n")
                     
@@ -58,6 +56,7 @@ class FrenchTokenizerTrainer:
             model_prefix = str(Path(output_path) / "french_sp")
             
             cpu_count = multiprocessing.cpu_count()
+            reduced_threads = max(1, cpu_count // 2)  # Réduire le nombre de threads à la moitié
             
             # Configuration améliorée de SentencePiece pour CamemBERT
             spm.SentencePieceTrainer.train(
@@ -68,12 +67,12 @@ class FrenchTokenizerTrainer:
                 model_type="unigram",        # Comme spécifié dans l'article
                 add_dummy_prefix=False,      # Pas de préfixe fictif
                 normalization_rule_name="identity",  # Pas de normalisation
-                user_defined_symbols=["<s>","</s>","<pad>","<mask>","<unk>"],
+                user_defined_symbols=["<s>", "</s>", "<pad>", "<mask>"], 
                 # Ajouts recommandés:
                 input_sentence_size=10000000,  # Pour les 10^7 phrases
                 shuffle_input_sentence=True,   # Mélange des phrases
                 train_extremely_large_corpus=True,  # Pour OSCAR
-                num_threads=cpu_count  # Utiliser tous les cœurs disponibles
+                num_threads=reduced_threads  # Utiliser la moitié des cœurs disponibles
             )
             
             return model_prefix + ".model", model_prefix + ".vocab"

@@ -19,7 +19,7 @@ class ModelArguments:
     attention_probs_dropout_prob: float = 0.1
     type_vocab_size: int = 1
     layer_norm_eps: float = 1e-5
-    hidden_act: str = "gelu"  # Activation par défaut RoBERTa
+    hidden_act: str = "gelu"  # Activation par Choix article
 
     learning_rate: float = 6e-4  # Learning rate de base CamemBERT
     warmup_ratio: float = 0.06  # 6% comme CamemBERT
