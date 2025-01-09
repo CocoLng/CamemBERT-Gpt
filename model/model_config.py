@@ -19,7 +19,7 @@ class ModelArguments:
     attention_probs_dropout_prob: float = 0.1
     type_vocab_size: int = 1
     layer_norm_eps: float = 1e-5
-    hidden_act: str = "gelu"  # Activation par Choix article
+    hidden_act: str = "gelu"  # Activation par défaut RoBERTa
 
     learning_rate: float = 6e-4  # Learning rate de base CamemBERT
     warmup_ratio: float = 0.06  # 6% comme CamemBERT
@@ -131,7 +131,7 @@ class ModelConfig:
                 if not run_handler.data_loader.is_ready():
                     return "❌ Erreur: Veuillez d'abord charger le dataset", ""
 
-                from ..process.train import TrainingConfig
+                from process.train import TrainingConfig
 
                 run_handler.training_config = TrainingConfig(
                     self, run_handler.data_loader
