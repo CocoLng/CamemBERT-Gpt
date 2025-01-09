@@ -48,3 +48,13 @@ Ce projet vise à recréer le modèle CamemBERT pour une utilisation dans un pro
 ## Modèle
 
 Les poids du modèle peuvent être trouvés à l'adresse suivante : https://huggingface.co/CocoLng/CamemBERT-Gpt
+
+## Branches
+- camembert-interfaced : branche de @CocoLng
+- camtest : branche de @DorianMB
+- fine_tune_training de @strculande
+- finetune_test de @LeoBellali
+
+## Contact
+
+Pour des questions liées au NLI ou au fine-tunning contacter @strculande ou @LeoBellali sinon pour le reste @CocoLng
