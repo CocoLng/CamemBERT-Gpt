@@ -99,12 +99,12 @@ class Run_Handler:
                 with gr.Row():
                     with gr.Column():
                         vocab_size = gr.Slider(
-                            minimum=32000,
+                            minimum=2000,
                             maximum=50265,
-                            value=50265,
+                            value=32000,
                             step=1000,
                             label="Taille du Vocabulaire (vocab_size)",
-                            info="Choix article: 50265",
+                            info="Choix article: 32000",
                         )
                         hidden_size = gr.Slider(
                             minimum=128,
@@ -357,7 +357,7 @@ class Run_Handler:
                             label="Nom du tokenizer"
                         )
                         load_model_btn = gr.Button("Charger le Modèle")
-                        model_status = gr.Textbox(
+                        model_nli_status = gr.Textbox(
                             label="Statut du Modèle",
                             interactive=False
                         )
@@ -378,7 +378,7 @@ class Run_Handler:
                             config_path,
                             tokenizer_name
                         ],
-                        outputs=[model_status]
+                        outputs=[model_nli_status]
                     )
 
                 gr.Markdown("### Configuration du Dataset NLI")
@@ -457,7 +457,7 @@ class Run_Handler:
                 with gr.Row():
                     start_ft_btn = gr.Button("Démarrer le Fine-tuning")
                     stop_ft_btn = gr.Button("Arrêter le Fine-tuning")
-                    training_status = gr.Textbox(
+                    training_fn_status = gr.Textbox(
                         label="Statut de l'Entraînement",
                         interactive=False
                     )
@@ -497,12 +497,12 @@ class Run_Handler:
                         num_epochs, batch_size, learning_rate, num_labels,
                         save_dir, use_tensorboard
                     ],
-                    outputs=[training_status]
+                    outputs=[training_fn_status]
                 )
 
                 stop_ft_btn.click(
                     fn=self.fine_tuning.stop_training,
-                    outputs=[training_status]
+                    outputs=[training_fn_status]
                 )
 
                 evaluate_btn.click(

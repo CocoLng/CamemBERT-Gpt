@@ -6,7 +6,7 @@ import torch
 import wandb
 from transformers import RobertaForMaskedLM, Trainer, TrainingArguments
 
-from ..data.masking_monitor import (
+from data.masking_monitor import (
     MaskingHandler,
     MaskingMonitorCallback,
 )
@@ -178,7 +178,6 @@ class TrainingConfig:
             if not self.data_loader.is_ready():
                 raise ValueError("Dataset not loaded")
 
-            # Utilisation de masking_handler pour le data_collator
             sample_batch = next(iter(self.data_loader.dataset))
             required_fields = {"input_ids", "attention_mask", "special_tokens_mask"}
 
